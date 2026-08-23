@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+
+# Models (downloaded weights)
+models/
+
+# Env / local config
+.env
+
+# OS
+.DS_Store
