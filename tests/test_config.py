@@ -10,7 +10,7 @@ def test_defaults(monkeypatch):
     cfg = Config.from_env(env_file=None)
     assert cfg.llm.base_url == "http://localhost:11434/v1"
     assert cfg.vad.threshold == 0.6
-    assert cfg.tts.backend == "marvis"
+    assert cfg.tts.backend == "chatterbox"
     assert cfg.stt_model == "base"
 
 

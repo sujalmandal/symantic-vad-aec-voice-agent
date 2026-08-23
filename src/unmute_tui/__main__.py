@@ -24,16 +24,10 @@ from .vad.silero_vad import SileroVAD
 from .vad.smart_turn import SmartTurn
 
 SMART_TURN_FILENAME = "smart-turn-v3.2-cpu.onnx"
-DEFAULT_VOICE_FILENAME = "default-voice.wav"
 
 
 def _smart_turn_path(models_dir: Path) -> Path:
     return models_dir / SMART_TURN_FILENAME
-
-
-def _default_ref_audio(models_dir: Path) -> str | None:
-    p = models_dir / DEFAULT_VOICE_FILENAME
-    return str(p) if p.exists() else None
 
 
 def build_engine(config: Config):
@@ -44,13 +38,15 @@ def build_engine(config: Config):
         smart_turn=smart_turn,
         silero=silero,
         threshold=config.vad.threshold,
+        turn_end_silence_sec=config.vad.turn_end_silence_sec,
+        semantic_min_silence_sec=config.vad.semantic_min_silence_sec,
     )
     transcriber = Transcriber(
         model_size=config.stt_model,
         language=config.stt_language,
     )
     llm = LLM(config.llm)
-    tts = create_tts(config.tts, default_ref_audio=_default_ref_audio(config.models_dir))
+    tts = create_tts(config.tts)
     mic = Microphone(device=config.audio.input_device)
     player = AudioPlayer(device=config.audio.output_device)
     return vad, transcriber, llm, tts, mic, player

@@ -3,32 +3,37 @@
 
 Downloads:
   * Smart Turn v3 (semantic VAD) ONNX model -> models/smart-turn-v3.2-cpu.onnx
+  * Kokoro-82M TTS ONNX model + voices -> models/kokoro-v1.0.onnx, voices-v1.0.bin
 
-Silero VAD, faster-whisper, and Marvis TTS weights are fetched automatically on
-first use by their respective libraries, so they are not downloaded here.
-(WebRTC AEC3 needs no model — it ships with the `pywebrtc-audio` wheel.)
-
-Usage:
-    python scripts/download_models.py [--models-dir models]
+Silero VAD and faster-whisper weights are fetched automatically on first use by
+their respective libraries. (WebRTC AEC3 needs no model.)
 """
 
 from __future__ import annotations
 
 import argparse
+import urllib.request
 from pathlib import Path
 
 SMART_TURN_REPO = "pipecat-ai/smart-turn-v3"
 SMART_TURN_FILE = "smart-turn-v3.2-cpu.onnx"
 
-# Default reference voice for Marvis TTS voice cloning (from the Qwen3-TTS repo).
-QWEN_DEFAULT_VOICE_URL = (
-    "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-TTS-Repo/clone.wav"
+KOKORO_ONNX_URL = (
+    "https://github.com/thewh1teagle/kokoro-onnx/releases/download/"
+    "model-files-v1.1/kokoro-v1.0.onnx"
 )
-DEFAULT_VOICE_FILE = "default-voice.wav"
-DEFAULT_VOICE_TEXT = (
-    "Okay. Yeah. I resent you. I love you. I respect you. "
-    "But you know what? You blew it! And thanks to you."
+KOKORO_VOICES_URL = (
+    "https://github.com/thewh1teagle/kokoro-onnx/releases/download/"
+    "model-files-v1.1/voices-v1.0.bin"
 )
+KOKORO_ONNX_FILE = "kokoro-v1.0.onnx"
+KOKORO_VOICES_FILE = "voices-v1.0.bin"
+
+
+def _download_url(url: str, dest: Path) -> None:
+    print(f"Downloading {url} -> {dest} ...")
+    urllib.request.urlretrieve(url, dest)
+    print(f"Downloaded to {dest}")
 
 
 def main() -> None:
@@ -60,19 +65,17 @@ def main() -> None:
         )
         print(f"Downloaded to {path}")
 
-    # Default Marvis TTS reference voice.
-    voice_dest = models_dir / DEFAULT_VOICE_FILE
-    if voice_dest.exists():
-        print(f"Default voice already present: {voice_dest}")
+    # Kokoro-82M TTS ONNX model + voice embeddings.
+    onnx_dest = models_dir / KOKORO_ONNX_FILE
+    voices_dest = models_dir / KOKORO_VOICES_FILE
+    if onnx_dest.exists():
+        print(f"Kokoro ONNX model already present: {onnx_dest}")
     else:
-        print(f"Downloading default voice -> {voice_dest} ...")
-        import urllib.request
-
-        urllib.request.urlretrieve(QWEN_DEFAULT_VOICE_URL, voice_dest)
-        print(f"Downloaded to {voice_dest}")
-
-    print("\nDefault reference text (set TTS_REF_TEXT to override):")
-    print(f"  {DEFAULT_VOICE_TEXT}")
+        _download_url(KOKORO_ONNX_URL, onnx_dest)
+    if voices_dest.exists():
+        print(f"Kokoro voices already present: {voices_dest}")
+    else:
+        _download_url(KOKORO_VOICES_URL, voices_dest)
 
 
 if __name__ == "__main__":

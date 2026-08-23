@@ -64,6 +64,12 @@ class VADConfig:
     smart_turn_window_sec: float = SMART_TURN_WINDOW_SEC
     # Frames quieter than this RMS are treated as silence (filters ambient noise).
     energy_threshold: float = 0.01
+    # Hard, reliable turn-end: after the user stops speaking, this much sustained
+    # silence ends their turn (works even if the semantic model errs).
+    turn_end_silence_sec: float = 0.7
+    # Semantic accelerator: if Smart Turn is confident (prob > threshold) AND this
+    # much silence has elapsed, end the turn sooner.
+    semantic_min_silence_sec: float = 0.4
     # Mute the mic while the bot is speaking. Without echo cancellation (e.g.
     # when not on headphones) the bot would hear its own TTS and interrupt
     # itself. Disable to allow barge-in (requires headphones/echo cancellation).
@@ -72,14 +78,16 @@ class VADConfig:
 
 @dataclass
 class TTSConfig:
-    backend: str = "marvis"  # marvis | edge | piper
-    voice: str = "en-US-AriaNeural"
-    # Marvis TTS model id / local path.
-    marvis_model: str = "Marvis-AI/marvis-tts-250m-v0.2"
-    language: str = "English"
-    # Reference audio for Marvis voice cloning (optional; defaults to bundled).
-    ref_audio: str | None = None
-    ref_text: str | None = None
+    backend: str = "chatterbox"  # chatterbox | kokoro | edge | piper
+    voice: str = "en-US-AriaNeural"  # edge-tts voice / piper voice path
+    # Chatterbox-Turbo (mlx-audio, MLX on Apple Silicon).
+    chatterbox_model: str = "mlx-community/chatterbox-turbo-4bit"
+    # Kokoro-82M (kokoro-onnx).
+    kokoro_model: str = "models/kokoro-v1.0.onnx"
+    kokoro_voices: str = "models/voices-v1.0.bin"
+    kokoro_voice: str = "af_heart"
+    kokoro_speed: float = 1.0
+    kokoro_lang: str = "en-us"
 
 
 @dataclass
@@ -132,19 +140,29 @@ class Config:
                     DEFAULT_UNINTERRUPTIBLE_BY_VAD_TIME_SEC,
                 ),
                 energy_threshold=_env_float("VAD_ENERGY_THRESHOLD", 0.01),
+                turn_end_silence_sec=_env_float("TURN_END_SILENCE_SEC", 0.7),
+                semantic_min_silence_sec=_env_float(
+                    "SEMANTIC_MIN_SILENCE_SEC", 0.4
+                ),
                 mute_mic_while_bot_speaking=_env_bool(
                     "MUTE_MIC_WHILE_BOT_SPEAKING", True
                 ),
             ),
             tts=TTSConfig(
-                backend=os.getenv("TTS_BACKEND", "marvis").strip().lower(),
+                backend=os.getenv("TTS_BACKEND", "chatterbox").strip().lower(),
                 voice=os.getenv("TTS_VOICE", "en-US-AriaNeural"),
-                marvis_model=os.getenv(
-                    "MARVIS_MODEL", "Marvis-AI/marvis-tts-250m-v0.2"
+                chatterbox_model=os.getenv(
+                    "CHATTERBOX_MODEL", "mlx-community/chatterbox-turbo-4bit"
                 ),
-                language=os.getenv("TTS_LANGUAGE", "English"),
-                ref_audio=os.getenv("TTS_REF_AUDIO") or None,
-                ref_text=os.getenv("TTS_REF_TEXT") or None,
+                kokoro_model=os.getenv(
+                    "KOKORO_MODEL", "models/kokoro-v1.0.onnx"
+                ),
+                kokoro_voices=os.getenv(
+                    "KOKORO_VOICES", "models/voices-v1.0.bin"
+                ),
+                kokoro_voice=os.getenv("KOKORO_VOICE", "af_heart"),
+                kokoro_speed=_env_float("KOKORO_SPEED", 1.0),
+                kokoro_lang=os.getenv("KOKORO_LANG", "en-us"),
             ),
             audio=AudioConfig(
                 input_device=_env_int("INPUT_DEVICE", 0) or None,

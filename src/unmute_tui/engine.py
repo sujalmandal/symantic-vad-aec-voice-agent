@@ -169,7 +169,7 @@ class ConversationEngine:
         This is the "gate": it must be called before the asyncio event loop
         starts (i.e. before the TUI/headless loop runs). Loading models inside
         the event loop via threads can conflict with subprocess-spawning model
-        loaders (faster-whisper / mlx-audio), so we load synchronously up front.
+        loaders (e.g. faster-whisper), so we load synchronously up front.
         """
         self.vad.smart_turn.load()
         self.vad.silero.load()

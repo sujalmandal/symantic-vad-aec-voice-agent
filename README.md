@@ -19,7 +19,7 @@ mid-sentence.
 | Long-silence `"..."` marker | same |
 | Bot ends with `"Bye!"` | same |
 | Any OpenAI-compatible LLM | Ollama (local) or cloud (OpenAI/OpenRouter) |
-| Kyutai TTS | **Marvis TTS** (real-time streaming, MLX-native; edge-tts/piper fallbacks) |
+| Kyutai TTS | **Chatterbox-Turbo TTS** (natural, expressive, real-time local; kokoro/edge/piper fallbacks) |
 
 ## Architecture
 
@@ -32,19 +32,20 @@ Terminal TUI (textual) ── asyncio events ──┐
         ▼               ▼                  ▼                  ▼
    Audio Capture    Semantic VAD        STT (words)        LLM (OpenAI-compat)
    (sounddevice)   Silero (activity)   faster-whisper      Ollama / cloud
-                   + Smart Turn v3     (streaming)         ──► TTS (Marvis)
+                   + Smart Turn v3     (streaming)         ──► TTS (Chatterbox)
                    (turn-end prob)                          (streaming) ──► playback
 ```
 
-### Semantic VAD
-[Smart Turn v3](https://github.com/pipecat-ai/smart-turn) is an audio-native
-model (8M params, 8MB int8 ONNX, ~10ms CPU inference) that predicts the
-probability the speaker has **finished their turn** from the raw waveform —
-using prosody and acoustic cues, not a transcript. It runs alongside
-[Silero VAD](https://github.com/snakers4/silero-vad) (raw speech activity).
-The turn-end probability is smoothed with an exponential moving average
-(attack/release) and compared against a threshold (default `0.6`), mirroring
-unmute's `determine_pause()` logic.
+### Semantic VAD (semantic + silence)
+Turn-end detection combines two signals for reliability:
+- **Silence-based** (reliable): [Silero VAD](https://github.com/snakers4/silero-vad)
+  detects speech activity; once you stop speaking, ~`TURN_END_SILENCE_SEC` (0.7s)
+  of sustained silence ends the turn — this always works.
+- **Semantic** (accelerator): [Smart Turn v3](https://github.com/pipecat-ai/smart-turn)
+  (8M params, 8MB int8 ONNX, ~10ms CPU) predicts the probability you've
+  **finished your turn** from the raw waveform (prosody, not transcript). When
+  it's confident (prob > `VAD_THRESHOLD`) after a short silence
+  (`SEMANTIC_MIN_SILENCE_SEC`, 0.4s), it ends the turn sooner.
 
 ## Requirements
 
@@ -61,7 +62,7 @@ unmute's `determine_pause()` logic.
 # 1. Install dependencies (core + STT + dev)
 uv sync --extra stt --extra dev
 
-# 2. Download the semantic VAD model + default reference voice
+# 2. Download the semantic VAD model
 uv run python scripts/download_models.py
 
 # 3. Configure your LLM (copy and edit)
@@ -71,8 +72,9 @@ cp .env.example .env
 #   - Cloud OpenRouter: LLM_BASE_URL=https://openrouter.ai/api/v1  LLM_API_KEY=sk-or-...
 ```
 
-Marvis TTS (the default `TTS_BACKEND`) downloads its ~500MB model on first use
-via `mlx-audio`.
+Chatterbox-Turbo TTS (the default `TTS_BACKEND`) runs locally on Apple Silicon
+via `mlx-audio`; its model downloads on first use. It's natural and expressive
+with inline emotion tags like `[sigh]` and `[laugh]`.
 
 ## Single-file version
 
@@ -82,9 +84,9 @@ you can run it without the package layout:
 ```bash
 # Install dependencies once
 pip install numpy sounddevice onnxruntime transformers silero-vad \
-            faster-whisper openai textual edge-tts python-dotenv mlx-audio
+            faster-whisper openai textual edge-tts python-dotenv kokoro-onnx mlx-audio
 
-# Download the VAD model + default voice, then run
+# Download the VAD model, then run
 python unmute_tui.py --download-models
 python unmute_tui.py            # TUI
 python unmute_tui.py --no-tui   # headless
@@ -106,12 +108,12 @@ See [`.env.example`](.env.example). Key settings:
   (e.g. MiniMax: `https://api.minimax.io/v1`, model `MiniMax-M3`).
 - `LLM_THINKING` — MiniMax-M3 thinking control: `disabled` (faster, no
   chain-of-thought) or `adaptive`. Empty = default.
-- `TTS_BACKEND` — `marvis` (default), `edge`, or `piper`.
-- `MARVIS_MODEL` — Marvis TTS model id / local path.
-- `TTS_REF_AUDIO` / `TTS_REF_TEXT` — reference voice for Marvis voice cloning
-  (defaults to the bundled sample; point to your own `.wav` to clone a custom
-  voice).
-- `VAD_THRESHOLD` — turn-end probability threshold (default `0.6`).
+- `TTS_BACKEND` — `chatterbox` (default), `kokoro`, `edge`, or `piper`.
+- `CHATTERBOX_MODEL` — Chatterbox-Turbo MLX model (default `mlx-community/chatterbox-turbo-4bit`).
+- `KOKORO_MODEL` / `KOKORO_VOICES` / `KOKORO_VOICE` / `KOKORO_SPEED` / `KOKORO_LANG` — Kokoro fallback.
+- `VAD_THRESHOLD` — semantic turn-end probability threshold (default `0.6`).
+- `TURN_END_SILENCE_SEC` / `SEMANTIC_MIN_SILENCE_SEC` — turn-end silence
+  (reliable fallback) and semantic accelerator silence.
 - `USER_SILENCE_TIMEOUT` — seconds before the `"..."` marker (default `7.0`).
 - `UNINTERRUPTIBLE_BY_VAD_TIME_SEC` — bot's protected window at turn start.
 - `STT_MODEL` — faster-whisper size (`tiny`/`base`/`small`/`medium`).
@@ -150,8 +152,8 @@ uv run pytest
 ## Notes & limitations
 
 - The exact Kyutai STT/TTS models require CUDA/Linux and cannot run on this Mac;
-  Smart Turn v3 and Marvis TTS are equivalent local replacements.
-- Marvis TTS is MLX-native (Apple Silicon). On other platforms, set
-  `TTS_BACKEND=edge` (free, cloud) or `piper` (local).
-- Barge-in uses a short protected window at the start of the bot's turn to
-  avoid echo-triggered self-interruption (no echo cancellation in the terminal).
+  Smart Turn v3 and Chatterbox-Turbo are equivalent local replacements.
+- Chatterbox-Turbo runs via `mlx-audio` on Apple Silicon. On other platforms, set
+  `TTS_BACKEND=kokoro` (local) or `edge` (free, cloud).
+- Barge-in uses WebRTC AEC3 (works without headphones). For guaranteed
+  no-self-reply without AEC, set `MUTE_MIC_WHILE_BOT_SPEAKING=true`.

@@ -1,9 +1,10 @@
 """Text-to-speech backends.
 
-Primary backend is Marvis TTS (real-time streaming, MLX-native on Apple
-Silicon). Fallbacks: edge-tts (free, cloud) and piper (local). All backends
-expose a common async interface that yields 16 kHz mono float32 audio chunks so
-the engine can play incrementally.
+Primary backend is Chatterbox-Turbo via `mlx-audio` (natural, expressive with
+emotion tags, near real-time on Apple Silicon, local). Alternatives: kokoro
+(kokoro-onnx), edge-tts (free, cloud), and piper (local). All backends expose a
+common async interface that yields 16 kHz mono float32 audio chunks so the
+engine can play incrementally.
 """
 
 from __future__ import annotations
@@ -48,15 +49,15 @@ class TTSBackend(ABC):
             yield audio
 
 
-class MarvisTTSBackend(TTSBackend):
-    """Marvis TTS (real-time streaming, MLX-native on Apple Silicon).
+class ChatterboxTTSBackend(TTSBackend):
+    """Chatterbox-Turbo via `mlx-audio` (natural, expressive, near real-time).
 
-    Uses the `mlx-audio` package. Streams audio chunks as text is processed.
+    Streams audio chunks as text is processed (MLX on Apple Silicon). Supports
+    inline emotion tags like [sigh] and [laugh].
     """
 
-    def __init__(self, config: TTSConfig, default_ref_audio: str | None = None) -> None:
+    def __init__(self, config: TTSConfig) -> None:
         self.config = config
-        self.default_ref_audio = default_ref_audio
         self._model = None
 
     def _load(self):
@@ -68,15 +69,12 @@ class MarvisTTSBackend(TTSBackend):
                     "mlx-audio is not installed. Run `uv sync` (or "
                     "`pip install mlx-audio`)."
                 ) from exc
-            self._model = generate.load_model(self.config.marvis_model)
+            self._model = generate.load_model(self.config.chatterbox_model)
         return self._model
 
     def load(self) -> None:
-        """Pre-load the Marvis model so the first reply streams immediately."""
+        """Pre-load the Chatterbox model so the first reply is instant."""
         self._load()
-
-    def _ref_audio(self) -> str | None:
-        return self.config.ref_audio or self.default_ref_audio
 
     async def synthesize(self, text: str) -> np.ndarray:
         chunks = [c async for c in self.stream(text)]
@@ -86,21 +84,22 @@ class MarvisTTSBackend(TTSBackend):
 
     async def stream(self, text: str) -> AsyncIterator[np.ndarray]:
         model = self._load()
-        ref_audio = self._ref_audio()
         loop = asyncio.get_running_loop()
         q: asyncio.Queue = asyncio.Queue()
 
         def _run() -> None:
+            import contextlib
+            import io
+
             try:
-                for r in model.generate(
-                    text=text,
-                    stream=True,
-                    ref_audio=ref_audio,
-                    ref_text=self.config.ref_text,
-                    verbose=False,
-                ):
-                    audio = np.asarray(r.audio, dtype=np.float32)
-                    q.put_nowait(resample_to_16k(audio, r.sample_rate))
+                with contextlib.redirect_stdout(io.StringIO()):
+                    for r in model.generate(
+                        text=text,
+                        stream=True,
+                        verbose=False,
+                    ):
+                        audio = np.asarray(r.audio, dtype=np.float32)
+                        q.put_nowait(resample_to_16k(audio, r.sample_rate))
             except Exception as exc:  # noqa: BLE001
                 q.put_nowait(exc)
             finally:
@@ -115,6 +114,63 @@ class MarvisTTSBackend(TTSBackend):
                 raise item
             yield item
         await task
+
+
+class KokoroTTSBackend(TTSBackend):
+    """Kokoro-82M TTS via `kokoro-onnx` (fast, natural, lightweight, offline).
+
+    `Kokoro.create()` is a synchronous, near-real-time call returning
+    (samples, sr); we run it in a thread and resample to 16 kHz. Kokoro is
+    not streaming, so the base `stream()` yields the whole sentence as one
+    chunk — acceptable because the engine synthesizes sentence-by-sentence.
+    """
+
+    def __init__(self, config: TTSConfig) -> None:
+        self.config = config
+        self._kokoro = None
+
+    def _load(self):
+        if self._kokoro is None:
+            try:
+                from kokoro_onnx import Kokoro
+            except ImportError as exc:  # pragma: no cover
+                raise RuntimeError(
+                    "kokoro-onnx is not installed. Run `uv sync` (or "
+                    "`pip install kokoro-onnx`)."
+                ) from exc
+            if not self.config.kokoro_model or not self.config.kokoro_voices:
+                raise FileNotFoundError(
+                    "Kokoro model files not configured. Set KOKORO_MODEL and "
+                    "KOKORO_VOICES, or run `python scripts/download_models.py`."
+                )
+            from pathlib import Path
+
+            if not Path(self.config.kokoro_model).exists() or not Path(
+                self.config.kokoro_voices
+            ).exists():
+                raise FileNotFoundError(
+                    "Kokoro model files not found. Run "
+                    "`python scripts/download_models.py`."
+                )
+            self._kokoro = Kokoro(self.config.kokoro_model, self.config.kokoro_voices)
+        return self._kokoro
+
+    def load(self) -> None:
+        """Pre-load the Kokoro model so the first reply is instant."""
+        self._load()
+
+    async def synthesize(self, text: str) -> np.ndarray:
+        kokoro = self._load()
+        samples, sr = await asyncio.to_thread(
+            kokoro.create,
+            text,
+            self.config.kokoro_voice,
+            self.config.kokoro_speed,
+            self.config.kokoro_lang,
+        )
+        if samples is None or len(samples) == 0:
+            return np.zeros(0, dtype=np.float32)
+        return resample_to_16k(np.asarray(samples, dtype=np.float32), int(sr))
 
 
 class EdgeTTSBackend(TTSBackend):
@@ -200,14 +256,17 @@ def _decode_mp3_to_pcm(mp3_bytes: bytes) -> np.ndarray:
     return np.frombuffer(proc.stdout, dtype=np.float32).copy()
 
 
-def create_tts(config: TTSConfig, default_ref_audio: str | None = None) -> TTSBackend:
+def create_tts(config: TTSConfig) -> TTSBackend:
     backend = config.backend.strip().lower()
-    if backend == "marvis":
-        return MarvisTTSBackend(config, default_ref_audio=default_ref_audio)
+    if backend == "chatterbox":
+        return ChatterboxTTSBackend(config)
+    if backend == "kokoro":
+        return KokoroTTSBackend(config)
     if backend == "edge":
         return EdgeTTSBackend(config)
     if backend == "piper":
         return PiperTTSBackend(config)
     raise ValueError(
-        f"Unknown TTS backend '{backend}'. Choose from: marvis, edge, piper."
+        f"Unknown TTS backend '{backend}'. "
+        f"Choose from: chatterbox, kokoro, edge, piper."
     )

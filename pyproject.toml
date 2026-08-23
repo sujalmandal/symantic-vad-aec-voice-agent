@@ -17,6 +17,7 @@ dependencies = [
     "pydantic>=2.6",
     "edge-tts>=6.1",
     "huggingface_hub>=0.23",
+    "kokoro-onnx>=0.6",
     "mlx-audio>=0.5",
     "pywebrtc-audio>=0.1",
 ]

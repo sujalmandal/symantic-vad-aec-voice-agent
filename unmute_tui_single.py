@@ -3,7 +3,7 @@
 
 A full-duplex spoken conversation with an LLM, driven by a semantic VAD
 (turn-end detection from speech content) and a fluent turn-taking engine with
-barge-in interruption and streaming TTS (Marvis).
+barge-in interruption and streaming TTS (Kokoro).
 
 Run:
     python unmute_tui.py --download-models   # one-time: fetch VAD model + voice
@@ -13,7 +13,7 @@ Run:
 
 Dependencies (install once):
     pip install numpy sounddevice onnxruntime transformers silero-vad \
-                faster-whisper openai textual edge-tts python-dotenv mlx-audio
+                faster-whisper openai textual edge-tts python-dotenv kokoro-onnx
 
 Configure via environment variables or a `.env` file (see README):
     LLM_BASE_URL, LLM_API_KEY, LLM_MODEL, TTS_BACKEND, VAD_THRESHOLD, ...
@@ -56,16 +56,18 @@ DEFAULT_UNINTERRUPTIBLE_BY_VAD_TIME_SEC = 3.0
 SMART_TURN_WINDOW_SEC = 8.0
 
 SMART_TURN_FILENAME = "smart-turn-v3.2-cpu.onnx"
-DEFAULT_VOICE_FILENAME = "default-voice.wav"
 SMART_TURN_REPO = "pipecat-ai/smart-turn-v3"
 SMART_TURN_FILE = "smart-turn-v3.2-cpu.onnx"
-QWEN_DEFAULT_VOICE_URL = (
-    "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-TTS-Repo/clone.wav"
+KOKORO_ONNX_URL = (
+    "https://github.com/thewh1teagle/kokoro-onnx/releases/download/"
+    "model-files-v1.1/kokoro-v1.0.onnx"
 )
-DEFAULT_VOICE_TEXT = (
-    "Okay. Yeah. I resent you. I love you. I respect you. "
-    "But you know what? You blew it! And thanks to you."
+KOKORO_VOICES_URL = (
+    "https://github.com/thewh1teagle/kokoro-onnx/releases/download/"
+    "model-files-v1.1/voices-v1.0.bin"
 )
+KOKORO_ONNX_FILE = "kokoro-v1.0.onnx"
+KOKORO_VOICES_FILE = "voices-v1.0.bin"
 
 INTERRUPTION_CHAR = "—"  # em-dash
 USER_SILENCE_MARKER = "..."
@@ -112,17 +114,25 @@ class VADConfig:
     uninterruptible_by_vad_time_sec: float = DEFAULT_UNINTERRUPTIBLE_BY_VAD_TIME_SEC
     smart_turn_window_sec: float = SMART_TURN_WINDOW_SEC
     energy_threshold: float = 0.01
+    # Hard turn-end silence fallback (reliable even if semantic model errs).
+    turn_end_silence_sec: float = 0.7
+    # Semantic accelerator: Smart Turn can end the turn after this much silence.
+    semantic_min_silence_sec: float = 0.4
     mute_mic_while_bot_speaking: bool = True
 
 
 @dataclass
 class TTSConfig:
-    backend: str = "marvis"  # marvis | edge | piper
-    voice: str = "en-US-AriaNeural"
-    marvis_model: str = "Marvis-AI/marvis-tts-250m-v0.2"
-    language: str = "English"
-    ref_audio: str | None = None
-    ref_text: str | None = None
+    backend: str = "chatterbox"  # chatterbox | kokoro | edge | piper
+    voice: str = "en-US-AriaNeural"  # edge-tts voice / piper voice path
+    # Chatterbox-Turbo (mlx-audio, MLX on Apple Silicon).
+    chatterbox_model: str = "mlx-community/chatterbox-turbo-4bit"
+    # Kokoro-82M (kokoro-onnx).
+    kokoro_model: str = "models/kokoro-v1.0.onnx"
+    kokoro_voices: str = "models/voices-v1.0.bin"
+    kokoro_voice: str = "af_heart"
+    kokoro_speed: float = 1.0
+    kokoro_lang: str = "en-us"
 
 
 @dataclass
@@ -173,19 +183,29 @@ class Config:
                     DEFAULT_UNINTERRUPTIBLE_BY_VAD_TIME_SEC,
                 ),
                 energy_threshold=_env_float("VAD_ENERGY_THRESHOLD", 0.01),
+                turn_end_silence_sec=_env_float("TURN_END_SILENCE_SEC", 0.7),
+                semantic_min_silence_sec=_env_float(
+                    "SEMANTIC_MIN_SILENCE_SEC", 0.4
+                ),
                 mute_mic_while_bot_speaking=_env_bool(
                     "MUTE_MIC_WHILE_BOT_SPEAKING", True
                 ),
             ),
             tts=TTSConfig(
-                backend=os.getenv("TTS_BACKEND", "marvis").strip().lower(),
+                backend=os.getenv("TTS_BACKEND", "chatterbox").strip().lower(),
                 voice=os.getenv("TTS_VOICE", "en-US-AriaNeural"),
-                marvis_model=os.getenv(
-                    "MARVIS_MODEL", "Marvis-AI/marvis-tts-250m-v0.2"
+                chatterbox_model=os.getenv(
+                    "CHATTERBOX_MODEL", "mlx-community/chatterbox-turbo-4bit"
                 ),
-                language=os.getenv("TTS_LANGUAGE", "English"),
-                ref_audio=os.getenv("TTS_REF_AUDIO") or None,
-                ref_text=os.getenv("TTS_REF_TEXT") or None,
+                kokoro_model=os.getenv(
+                    "KOKORO_MODEL", "models/kokoro-v1.0.onnx"
+                ),
+                kokoro_voices=os.getenv(
+                    "KOKORO_VOICES", "models/voices-v1.0.bin"
+                ),
+                kokoro_voice=os.getenv("KOKORO_VOICE", "af_heart"),
+                kokoro_speed=_env_float("KOKORO_SPEED", 1.0),
+                kokoro_lang=os.getenv("KOKORO_LANG", "en-us"),
             ),
             audio=AudioConfig(
                 input_device=_env_int("INPUT_DEVICE", 0) or None,
@@ -536,15 +556,23 @@ class TurnEndResult:
 class SemanticVAD:
     def __init__(
         self,
-        smart_turn: SmartTurn,
+        smart_turn: SmartTurn | None = None,
         silero: SileroVAD | None = None,
         threshold: float = 0.6,
         min_silence_sec: float = MIN_SILENCE_SEC,
+        turn_end_silence_sec: float = 0.7,
+        semantic_min_silence_sec: float = 0.4,
     ) -> None:
         self.smart_turn = smart_turn
         self.silero = silero or SileroVAD()
         self.threshold = threshold
         self.min_silence_frames = max(1, int(min_silence_sec / FRAME_TIME_SEC))
+        self.turn_end_silence_frames = max(
+            self.min_silence_frames, int(turn_end_silence_sec / FRAME_TIME_SEC)
+        )
+        self.semantic_min_silence_frames = max(
+            1, int(semantic_min_silence_sec / FRAME_TIME_SEC)
+        )
         self.ema = ExponentialMovingAverage(
             attack_time=EMA_ATTACK_TIME,
             release_time=EMA_RELEASE_TIME,
@@ -552,6 +580,7 @@ class SemanticVAD:
         )
         self._turn_buffer: list[np.ndarray] = []
         self._was_speaking = False
+        self._had_speech = False
         self._silence_frames = 0
         self._need_semantic = False
         self._last_raw: float | None = None
@@ -567,6 +596,7 @@ class SemanticVAD:
     def reset(self) -> None:
         self._turn_buffer = []
         self._was_speaking = False
+        self._had_speech = False
         self._silence_frames = 0
         self._need_semantic = False
         self._last_raw = None
@@ -583,6 +613,7 @@ class SemanticVAD:
         is_speech = self.silero.is_speech(frame)
         if is_speech:
             self._silence_frames = 0
+            self._had_speech = True
             if not self._was_speaking:
                 self._need_semantic = True
             self._was_speaking = True
@@ -591,15 +622,25 @@ class SemanticVAD:
         self._silence_frames += 1
         was_speaking = self._was_speaking
         self._was_speaking = False
-        if (was_speaking or self._need_semantic) and (
+        if self._had_speech and (was_speaking or self._need_semantic) and (
             self._silence_frames >= self.min_silence_frames
         ):
-            audio = self._turn_audio()
-            if len(audio) > 0:
-                self._last_raw = self.smart_turn.predict_endpoint(audio)
-                self.ema.update(dt=FRAME_TIME_SEC, new_value=self._last_raw)
+            if self.smart_turn is not None:
+                audio = self._turn_audio()
+                if len(audio) > 0:
+                    self._last_raw = self.smart_turn.predict_endpoint(audio)
+                    self.ema.update(dt=FRAME_TIME_SEC, new_value=self._last_raw)
             self._need_semantic = False
-        turn_end = self.ema.value > self.threshold
+        turn_end = False
+        if self._had_speech:
+            if (
+                self.smart_turn is not None
+                and self.ema.value > self.threshold
+                and self._silence_frames >= self.semantic_min_silence_frames
+            ):
+                turn_end = True
+            elif self._silence_frames >= self.turn_end_silence_frames:
+                turn_end = True
         if turn_end:
             audio = self._turn_audio()
             self.reset()
@@ -771,7 +812,7 @@ Keep your replies brief and conversational.
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TTS (Marvis primary; edge/piper fallbacks)
+# TTS (Kokoro primary; edge/piper fallbacks)
 # ─────────────────────────────────────────────────────────────────────────────
 def resample_to_16k(audio: np.ndarray, src_rate: int) -> np.ndarray:
     if src_rate == SAMPLE_RATE:
@@ -797,10 +838,15 @@ class TTSBackend(ABC):
             yield audio
 
 
-class MarvisTTSBackend(TTSBackend):
-    def __init__(self, config: TTSConfig, default_ref_audio: str | None = None) -> None:
+class ChatterboxTTSBackend(TTSBackend):
+    """Chatterbox-Turbo via `mlx-audio` (natural, expressive, near real-time).
+
+    Streams audio chunks as text is processed (MLX on Apple Silicon). Supports
+    inline emotion tags like [sigh] and [laugh].
+    """
+
+    def __init__(self, config: TTSConfig) -> None:
         self.config = config
-        self.default_ref_audio = default_ref_audio
         self._model = None
 
     def _load(self):
@@ -809,16 +855,14 @@ class MarvisTTSBackend(TTSBackend):
                 from mlx_audio.tts import generate
             except ImportError as exc:
                 raise RuntimeError(
-                    "mlx-audio is not installed. Run `pip install mlx-audio`."
+                    "mlx-audio is not installed. Run `uv sync` (or "
+                    "`pip install mlx-audio`)."
                 ) from exc
-            self._model = generate.load_model(self.config.marvis_model)
+            self._model = generate.load_model(self.config.chatterbox_model)
         return self._model
 
     def load(self) -> None:
         self._load()
-
-    def _ref_audio(self) -> str | None:
-        return self.config.ref_audio or self.default_ref_audio
 
     async def synthesize(self, text: str) -> np.ndarray:
         chunks = [c async for c in self.stream(text)]
@@ -828,21 +872,18 @@ class MarvisTTSBackend(TTSBackend):
 
     async def stream(self, text: str) -> AsyncIterator[np.ndarray]:
         model = self._load()
-        ref_audio = self._ref_audio()
         loop = asyncio.get_running_loop()
         q: asyncio.Queue = asyncio.Queue()
 
         def _run() -> None:
+            import contextlib
+            import io
+
             try:
-                for r in model.generate(
-                    text=text,
-                    stream=True,
-                    ref_audio=ref_audio,
-                    ref_text=self.config.ref_text,
-                    verbose=False,
-                ):
-                    audio = np.asarray(r.audio, dtype=np.float32)
-                    q.put_nowait(resample_to_16k(audio, r.sample_rate))
+                with contextlib.redirect_stdout(io.StringIO()):
+                    for r in model.generate(text=text, stream=True, verbose=False):
+                        audio = np.asarray(r.audio, dtype=np.float32)
+                        q.put_nowait(resample_to_16k(audio, r.sample_rate))
             except Exception as exc:  # noqa: BLE001
                 q.put_nowait(exc)
             finally:
@@ -857,6 +898,54 @@ class MarvisTTSBackend(TTSBackend):
                 raise item
             yield item
         await task
+
+
+class KokoroTTSBackend(TTSBackend):
+    """Kokoro-82M TTS via `kokoro-onnx` (fast, natural, lightweight, offline)."""
+
+    def __init__(self, config: TTSConfig) -> None:
+        self.config = config
+        self._kokoro = None
+
+    def _load(self):
+        if self._kokoro is None:
+            try:
+                from kokoro_onnx import Kokoro
+            except ImportError as exc:
+                raise RuntimeError(
+                    "kokoro-onnx is not installed. Run `uv sync` (or "
+                    "`pip install kokoro-onnx`)."
+                ) from exc
+            if not self.config.kokoro_model or not self.config.kokoro_voices:
+                raise FileNotFoundError(
+                    "Kokoro model files not configured. Set KOKORO_MODEL and "
+                    "KOKORO_VOICES, or run `python scripts/download_models.py`."
+                )
+            if not Path(self.config.kokoro_model).exists() or not Path(
+                self.config.kokoro_voices
+            ).exists():
+                raise FileNotFoundError(
+                    "Kokoro model files not found. Run "
+                    "`python scripts/download_models.py`."
+                )
+            self._kokoro = Kokoro(self.config.kokoro_model, self.config.kokoro_voices)
+        return self._kokoro
+
+    def load(self) -> None:
+        self._load()
+
+    async def synthesize(self, text: str) -> np.ndarray:
+        kokoro = self._load()
+        samples, sr = await asyncio.to_thread(
+            kokoro.create,
+            text,
+            self.config.kokoro_voice,
+            self.config.kokoro_speed,
+            self.config.kokoro_lang,
+        )
+        if samples is None or len(samples) == 0:
+            return np.zeros(0, dtype=np.float32)
+        return resample_to_16k(np.asarray(samples, dtype=np.float32), int(sr))
 
 
 class EdgeTTSBackend(TTSBackend):
@@ -933,16 +1022,19 @@ def _decode_mp3_to_pcm(mp3_bytes: bytes) -> np.ndarray:
     return np.frombuffer(proc.stdout, dtype=np.float32).copy()
 
 
-def create_tts(config: TTSConfig, default_ref_audio: str | None = None) -> TTSBackend:
+def create_tts(config: TTSConfig) -> TTSBackend:
     backend = config.backend.strip().lower()
-    if backend == "marvis":
-        return MarvisTTSBackend(config, default_ref_audio=default_ref_audio)
+    if backend == "chatterbox":
+        return ChatterboxTTSBackend(config)
+    if backend == "kokoro":
+        return KokoroTTSBackend(config)
     if backend == "edge":
         return EdgeTTSBackend(config)
     if backend == "piper":
         return PiperTTSBackend(config)
     raise ValueError(
-        f"Unknown TTS backend '{backend}'. Choose from: marvis, edge, piper."
+        f"Unknown TTS backend '{backend}'. "
+        f"Choose from: chatterbox, kokoro, edge, piper."
     )
 
 
@@ -1083,7 +1175,7 @@ class ConversationEngine:
         This is the "gate": it must be called before the asyncio event loop
         starts (i.e. before the TUI/headless loop runs). Loading models inside
         the event loop via threads can conflict with subprocess-spawning model
-        loaders (faster-whisper / mlx-audio), so we load synchronously up front.
+        loaders (e.g. faster-whisper), so we load synchronously up front.
         """
         self.vad.smart_turn.load()
         self.vad.silero.load()
@@ -1352,27 +1444,29 @@ def download_models(models_dir: str | Path = "models") -> None:
         )
         print(f"Downloaded to {path}")
 
-    voice_dest = models_dir / DEFAULT_VOICE_FILENAME
-    if voice_dest.exists():
-        print(f"Default voice already present: {voice_dest}")
+    # Kokoro-82M TTS ONNX model + voice embeddings.
+    onnx_dest = models_dir / KOKORO_ONNX_FILE
+    voices_dest = models_dir / KOKORO_VOICES_FILE
+    if onnx_dest.exists():
+        print(f"Kokoro ONNX model already present: {onnx_dest}")
     else:
-        print(f"Downloading default voice -> {voice_dest} ...")
         import urllib.request
 
-        urllib.request.urlretrieve(QWEN_DEFAULT_VOICE_URL, voice_dest)
-        print(f"Downloaded to {voice_dest}")
+        print(f"Downloading Kokoro ONNX model -> {onnx_dest} ...")
+        urllib.request.urlretrieve(KOKORO_ONNX_URL, onnx_dest)
+        print(f"Downloaded to {onnx_dest}")
+    if voices_dest.exists():
+        print(f"Kokoro voices already present: {voices_dest}")
+    else:
+        import urllib.request
 
-    print("\nDefault reference text (set TTS_REF_TEXT to override):")
-    print(f"  {DEFAULT_VOICE_TEXT}")
+        print(f"Downloading Kokoro voices -> {voices_dest} ...")
+        urllib.request.urlretrieve(KOKORO_VOICES_URL, voices_dest)
+        print(f"Downloaded to {voices_dest}")
 
 
 def _smart_turn_path(models_dir: Path) -> Path:
     return models_dir / SMART_TURN_FILENAME
-
-
-def _default_ref_audio(models_dir: Path) -> str | None:
-    p = models_dir / DEFAULT_VOICE_FILENAME
-    return str(p) if p.exists() else None
 
 
 def build_engine(config: Config):
@@ -1382,13 +1476,15 @@ def build_engine(config: Config):
         smart_turn=smart_turn,
         silero=silero,
         threshold=config.vad.threshold,
+        turn_end_silence_sec=config.vad.turn_end_silence_sec,
+        semantic_min_silence_sec=config.vad.semantic_min_silence_sec,
     )
     transcriber = Transcriber(
         model_size=config.stt_model,
         language=config.stt_language,
     )
     llm = LLM(config.llm)
-    tts = create_tts(config.tts, default_ref_audio=_default_ref_audio(config.models_dir))
+    tts = create_tts(config.tts)
     mic = Microphone(device=config.audio.input_device)
     player = AudioPlayer(device=config.audio.output_device)
     return vad, transcriber, llm, tts, mic, player
