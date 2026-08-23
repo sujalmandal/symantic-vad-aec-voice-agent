@@ -121,7 +121,7 @@ class ConversationEngine:
         # Consecutive speech frames required to trigger barge-in (reduces
         # echo-triggered self-interruption, since echo is usually intermittent).
         self._barge_in_frames = 0
-        self._barge_in_required = 10  # ~200 ms of sustained speech
+        self._barge_in_required = config.vad.barge_in_required_frames
         self._silence_count = 0
         self._mic_muted = False
 
@@ -203,13 +203,17 @@ class ConversationEngine:
                 frame = clean
             result = self.vad.process_frame(frame)
             self._emit(VADUpdate(result.probability, result.raw_probability))
-            await self._tick(result)
+            frame_rms = float(np.sqrt(np.mean(frame**2)))
+            await self._tick(result, frame_rms)
 
-    async def _tick(self, result) -> None:
+    async def _tick(self, result, frame_rms: float = 0.0) -> None:
         if self._state == "bot_speaking":
-            # Barge-in: the user starts talking over the bot. Require sustained
-            # speech so the bot's own echo doesn't interrupt it.
-            if self.vad.is_speaking:
+            # Barge-in: the user starts talking over the bot. Only count a frame
+            # as the user when it is above the barge-in energy floor: the AEC
+            # leaves a low-energy residual of the bot's own voice, which we must
+            # not treat as a barge-in (or the bot interrupts itself). Louder,
+            # sustained real user speech still triggers barge-in.
+            if self.vad.is_speaking and frame_rms >= self.config.vad.barge_in_min_rms:
                 self._barge_in_frames += 1
             else:
                 self._barge_in_frames = 0

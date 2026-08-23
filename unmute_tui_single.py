@@ -118,6 +118,9 @@ class VADConfig:
     turn_end_silence_sec: float = 0.7
     # Semantic accelerator: Smart Turn can end the turn after this much silence.
     semantic_min_silence_sec: float = 0.4
+    # Barge-in robust: min RMS (filters AEC echo residual) + frames required.
+    barge_in_min_rms: float = 0.03
+    barge_in_required_frames: int = 15
     mute_mic_while_bot_speaking: bool = True
 
 
@@ -187,6 +190,8 @@ class Config:
                 semantic_min_silence_sec=_env_float(
                     "SEMANTIC_MIN_SILENCE_SEC", 0.4
                 ),
+                barge_in_min_rms=_env_float("BARGE_IN_MIN_RMS", 0.03),
+                barge_in_required_frames=_env_int("BARGE_IN_REQUIRED_FRAMES", 15),
                 mute_mic_while_bot_speaking=_env_bool(
                     "MUTE_MIC_WHILE_BOT_SPEAKING", True
                 ),
@@ -1129,7 +1134,7 @@ class ConversationEngine:
         self.waiting_for_user_start = 0.0
         self.uninterruptible_until = 0.0
         self._barge_in_frames = 0
-        self._barge_in_required = 10  # ~200 ms of sustained speech
+        self._barge_in_required = config.vad.barge_in_required_frames
         self._silence_count = 0
         self._mic_muted = False
 
@@ -1202,11 +1207,15 @@ class ConversationEngine:
                 frame = clean
             result = self.vad.process_frame(frame)
             self._emit(VADUpdate(result.probability, result.raw_probability))
-            await self._tick(result)
+            frame_rms = float(np.sqrt(np.mean(frame**2)))
+            await self._tick(result, frame_rms)
 
-    async def _tick(self, result) -> None:
+    async def _tick(self, result, frame_rms: float = 0.0) -> None:
         if self._state == "bot_speaking":
-            if self.vad.is_speaking:
+            # Only count a frame as the user barge-in when it is above the
+            # barge-in energy floor; the AEC leaves a low-energy residual of the
+            # bot's own voice, which we must not treat as a barge-in.
+            if self.vad.is_speaking and frame_rms >= self.config.vad.barge_in_min_rms:
                 self._barge_in_frames += 1
             else:
                 self._barge_in_frames = 0

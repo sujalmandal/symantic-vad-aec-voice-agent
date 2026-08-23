@@ -114,6 +114,11 @@ See [`.env.example`](.env.example). Key settings:
 - `VAD_THRESHOLD` — semantic turn-end probability threshold (default `0.6`).
 - `TURN_END_SILENCE_SEC` / `SEMANTIC_MIN_SILENCE_SEC` — turn-end silence
   (reliable fallback) and semantic accelerator silence.
+- `BARGE_IN_MIN_RMS` / `BARGE_IN_REQUIRED_FRAMES` — barge-in robustness: while
+  the bot speaks, only treat the mic as the user if its AEC-cleaned RMS is at
+  least `BARGE_IN_MIN_RMS` and sustained for `BARGE_IN_REQUIRED_FRAMES`. This
+  ignores the AEC's low-level echo residual so the bot doesn't interrupt itself;
+  louder real user speech still barges in.
 - `USER_SILENCE_TIMEOUT` — seconds before the `"..."` marker (default `7.0`).
 - `UNINTERRUPTIBLE_BY_VAD_TIME_SEC` — bot's protected window at turn start.
 - `STT_MODEL` — faster-whisper size (`tiny`/`base`/`small`/`medium`).

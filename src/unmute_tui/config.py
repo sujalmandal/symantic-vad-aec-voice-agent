@@ -70,6 +70,15 @@ class VADConfig:
     # Semantic accelerator: if Smart Turn is confident (prob > threshold) AND this
     # much silence has elapsed, end the turn sooner.
     semantic_min_silence_sec: float = 0.4
+    # Barge-in robustness: while the bot is speaking, only count a frame as the
+    # user barge-in if the AEC-cleaned mic RMS is at least this value. The AEC
+    # leaves a low-energy residual of the bot's own voice; this gate ignores it
+    # so the bot doesn't interrupt itself, while louder real user speech still
+    # triggers barge-in.
+    barge_in_min_rms: float = 0.03
+    # Consecutive (energy-gated) speech frames required to trigger barge-in in
+    # the bot's turn. The echo residual is intermittent; real speech is sustained.
+    barge_in_required_frames: int = 15
     # Mute the mic while the bot is speaking. Without echo cancellation (e.g.
     # when not on headphones) the bot would hear its own TTS and interrupt
     # itself. Disable to allow barge-in (requires headphones/echo cancellation).
@@ -143,6 +152,10 @@ class Config:
                 turn_end_silence_sec=_env_float("TURN_END_SILENCE_SEC", 0.7),
                 semantic_min_silence_sec=_env_float(
                     "SEMANTIC_MIN_SILENCE_SEC", 0.4
+                ),
+                barge_in_min_rms=_env_float("BARGE_IN_MIN_RMS", 0.03),
+                barge_in_required_frames=_env_int(
+                    "BARGE_IN_REQUIRED_FRAMES", 15
                 ),
                 mute_mic_while_bot_speaking=_env_bool(
                     "MUTE_MIC_WHILE_BOT_SPEAKING", True
