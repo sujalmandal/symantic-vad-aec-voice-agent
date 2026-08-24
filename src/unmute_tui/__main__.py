@@ -105,8 +105,14 @@ def _make_engine(config: Config) -> ConversationEngine:
             noise_suppression=config.aec.noise_suppression,
             ns_level=config.aec.ns_level,
         )
+    backchannel = None
+    if config.backchannel.enabled:
+        from .backchannel import BotBackchannel
+
+        backchannel = BotBackchannel(config.backchannel)
     return ConversationEngine(
-        config, vad, transcriber, llm, tts, mic, player, events, aec=aec
+        config, vad, transcriber, llm, tts, mic, player, events,
+        aec=aec, backchannel=backchannel,
     )
 
 

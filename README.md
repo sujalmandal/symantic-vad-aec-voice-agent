@@ -119,6 +119,10 @@ See [`.env.example`](.env.example). Key settings:
   least `BARGE_IN_MIN_RMS` and sustained for `BARGE_IN_REQUIRED_FRAMES`. This
   ignores the AEC's low-level echo residual so the bot doesn't interrupt itself;
   louder real user speech still barges in.
+- `BACKCHANNEL_ENABLED` / `VAP_BC_MODEL` / `CPC_MODEL` / `BACKCHANNEL_THRESHOLD`
+  / `BACKCHANNEL_COOLDOWN_SEC` / `BACKCHANNEL_ACK_TEXT` — active-listening
+  backchannels: while the user is speaking, VAP predicts when to backchannel and
+  the bot emits a short ack ("Mm-hmm") without taking the turn. Off by default.
 - `USER_SILENCE_TIMEOUT` — seconds before the `"..."` marker (default `7.0`).
 - `UNINTERRUPTIBLE_BY_VAD_TIME_SEC` — bot's protected window at turn start.
 - `STT_MODEL` — faster-whisper size (`tiny`/`base`/`small`/`medium`).
@@ -147,6 +151,25 @@ half-duplex mode that guarantees no self-reply.
 
 No model download or C++ build is needed — AEC3 ships with the
 `pywebrtc-audio` wheel (`pip install pywebrtc-audio`).
+
+## Backchannels (active listening)
+
+While the user is speaking, the bot can emit short acknowledgments ("Mm-hmm",
+"Uh-huh") without taking the turn, so it feels like it's listening. It uses
+[VAP (Voice Activity Projection)](https://github.com/inokoj/VAP-Realtime) — a
+real-time (~8ms/frame) model that predicts when the listener should backchannel,
+from stereo audio (bot far-end + user near-end). The model code is vendored in
+`src/rvap/`; enable with:
+
+```bash
+BACKCHANNEL_ENABLED=true
+uv run python scripts/download_models.py   # fetches the VAP-BC + CPC models
+```
+
+The bot acks when VAP's backchannel probability exceeds `BACKCHANNEL_THRESHOLD`
+(0.5) and a cooldown (`BACKCHANNEL_COOLDOWN_SEC`) has elapsed. The ack never
+advances the conversation state (the user keeps their turn) and is fed to the
+AEC as reference so it isn't misheard as the user.
 
 ## Tests
 

@@ -95,6 +95,7 @@ class ConversationEngine:
         player: AudioPlayer,
         events: asyncio.Queue[EngineEvent],
         aec=None,  # optional WebRTCAEC
+        backchannel=None,  # optional BotBackchannel
     ) -> None:
         self.config = config
         self.vad = vad
@@ -105,6 +106,7 @@ class ConversationEngine:
         self.player = player
         self.events = events
         self.aec = aec
+        self.backchannel = backchannel
 
         self.chat_history: list[dict[str, str]] = [
             {"role": "system", "content": SYSTEM_PROMPT}
@@ -175,6 +177,8 @@ class ConversationEngine:
         self.vad.silero.load()
         self.transcriber.load()
         self.tts.load()
+        if self.backchannel is not None:
+            self.backchannel.load()
 
     async def run(self) -> None:
         self.mic.start()
@@ -205,6 +209,19 @@ class ConversationEngine:
             self._emit(VADUpdate(result.probability, result.raw_probability))
             frame_rms = float(np.sqrt(np.mean(frame**2)))
             await self._tick(result, frame_rms)
+
+            # Active-listening backchannels: while the user is speaking, if VAP
+            # predicts a backchannel, the bot emits a short ack without taking
+            # the turn (state stays user_speaking).
+            if (
+                self.backchannel is not None
+                and self._state == "user_speaking"
+                and not self._mic_muted
+            ):
+                prob = self.backchannel.push(frame)
+                if self.backchannel.should_ack(prob, self.audio_time):
+                    self.backchannel.mark_acked(self.audio_time)
+                    await self._speak_backchannel()
 
     async def _tick(self, result, frame_rms: float = 0.0) -> None:
         if self._state == "bot_speaking":
@@ -316,6 +333,21 @@ class ConversationEngine:
                 if self.aec is not None:
                     # Feed the TTS audio as the far-end reference so the AEC can
                     # remove it from the mic signal.
+                    self.aec.add_reference(chunk)
+                await asyncio.to_thread(self.player.play, chunk)
+
+    async def _speak_backchannel(self) -> None:
+        """Emit a short backchannel ack ("Mm-hmm") while the user is speaking.
+
+        Does NOT advance the conversation state (the user keeps their turn);
+        the ack audio is fed to the AEC as reference so it isn't misheard as
+        the user.
+        """
+        self._emit(Log("backchannel"))
+        text = self.config.backchannel.ack_text
+        async for chunk in self.tts.stream(text):
+            if len(chunk):
+                if self.aec is not None:
                     self.aec.add_reference(chunk)
                 await asyncio.to_thread(self.player.play, chunk)
 

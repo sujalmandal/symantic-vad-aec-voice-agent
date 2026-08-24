@@ -86,6 +86,21 @@ class VADConfig:
 
 
 @dataclass
+class BackchannelConfig:
+    # Bot active-listening backchannels via VAP (Voice Activity Projection).
+    # When the user is speaking and VAP predicts a backchannel, the bot emits a
+    # short ack ("Mm-hmm") without taking the turn.
+    enabled: bool = False
+    vap_bc_model: str = "models/vap-bc_state_dict_erica_10hz_3000msec.pt"
+    cpc_model: str = "models/60k_epoch4-d0f474de.pt"
+    frame_rate: int = 10
+    context_len_sec: float = 3.0
+    threshold: float = 0.5
+    cooldown_sec: float = 3.0
+    ack_text: str = "Mm-hmm."
+
+
+@dataclass
 class TTSConfig:
     backend: str = "chatterbox"  # chatterbox | kokoro | edge | piper
     voice: str = "en-US-AriaNeural"  # edge-tts voice / piper voice path
@@ -120,6 +135,7 @@ class Config:
     tts: TTSConfig = field(default_factory=TTSConfig)
     audio: AudioConfig = field(default_factory=AudioConfig)
     aec: AECConfig = field(default_factory=AECConfig)
+    backchannel: BackchannelConfig = field(default_factory=BackchannelConfig)
     models_dir: Path = Path("models")
     stt_model: str = "base"
     stt_language: str | None = None
@@ -186,6 +202,21 @@ class Config:
                 delay_ms=_env_int("AEC_DELAY_MS", 30),
                 noise_suppression=_env_bool("AEC_NOISE_SUPPRESSION", True),
                 ns_level=_env_int("AEC_NS_LEVEL", 1),
+            ),
+            backchannel=BackchannelConfig(
+                enabled=_env_bool("BACKCHANNEL_ENABLED", False),
+                vap_bc_model=os.getenv(
+                    "VAP_BC_MODEL",
+                    "models/vap-bc_state_dict_erica_10hz_3000msec.pt",
+                ),
+                cpc_model=os.getenv(
+                    "CPC_MODEL", "models/60k_epoch4-d0f474de.pt"
+                ),
+                frame_rate=_env_int("BACKCHANNEL_FRAME_RATE", 10),
+                context_len_sec=_env_float("BACKCHANNEL_CONTEXT_SEC", 3.0),
+                threshold=_env_float("BACKCHANNEL_THRESHOLD", 0.5),
+                cooldown_sec=_env_float("BACKCHANNEL_COOLDOWN_SEC", 3.0),
+                ack_text=os.getenv("BACKCHANNEL_ACK_TEXT", "Mm-hmm."),
             ),
             models_dir=models_dir,
             stt_model=os.getenv("STT_MODEL", "base"),

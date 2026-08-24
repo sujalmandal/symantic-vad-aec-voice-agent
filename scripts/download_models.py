@@ -29,6 +29,18 @@ KOKORO_VOICES_URL = (
 KOKORO_ONNX_FILE = "kokoro-v1.0.onnx"
 KOKORO_VOICES_FILE = "voices-v1.0.bin"
 
+# VAP / Voice Activity Projection (bot backchannels) model assets.
+VAP_BC_URL = (
+    "https://raw.githubusercontent.com/inokoj/VAP-Realtime/main/"
+    "asset/vap_bc/vap-bc_state_dict_erica_10hz_3000msec.pt"
+)
+CPC_URL = (
+    "https://raw.githubusercontent.com/inokoj/VAP-Realtime/main/"
+    "asset/cpc/60k_epoch4-d0f474de.pt"
+)
+VAP_BC_FILE = "vap-bc_state_dict_erica_10hz_3000msec.pt"
+CPC_FILE = "60k_epoch4-d0f474de.pt"
+
 
 def _download_url(url: str, dest: Path) -> None:
     print(f"Downloading {url} -> {dest} ...")
@@ -76,6 +88,18 @@ def main() -> None:
         print(f"Kokoro voices already present: {voices_dest}")
     else:
         _download_url(KOKORO_VOICES_URL, voices_dest)
+
+    # VAP backchannel model assets (optional; for bot backchannels).
+    vap_dest = models_dir / VAP_BC_FILE
+    cpc_dest = models_dir / CPC_FILE
+    if vap_dest.exists():
+        print(f"VAP-BC model already present: {vap_dest}")
+    else:
+        _download_url(VAP_BC_URL, vap_dest)
+    if cpc_dest.exists():
+        print(f"CPC encoder already present: {cpc_dest}")
+    else:
+        _download_url(CPC_URL, cpc_dest)
 
 
 if __name__ == "__main__":

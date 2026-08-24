@@ -31,6 +31,12 @@ import subprocess
 import sys
 import threading
 from abc import ABC, abstractmethod
+
+# When running from the repo, expose the vendored `rvap` (VAP backchannel model)
+# so bot backchannels work without installing the package.
+_src_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "src")
+if os.path.isdir(_src_dir) and _src_dir not in sys.path:
+    sys.path.insert(0, _src_dir)
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import AsyncIterator
@@ -125,6 +131,18 @@ class VADConfig:
 
 
 @dataclass
+class BackchannelConfig:
+    enabled: bool = False
+    vap_bc_model: str = "models/vap-bc_state_dict_erica_10hz_3000msec.pt"
+    cpc_model: str = "models/60k_epoch4-d0f474de.pt"
+    frame_rate: int = 10
+    context_len_sec: float = 3.0
+    threshold: float = 0.5
+    cooldown_sec: float = 3.0
+    ack_text: str = "Mm-hmm."
+
+
+@dataclass
 class TTSConfig:
     backend: str = "chatterbox"  # chatterbox | kokoro | edge | piper
     voice: str = "en-US-AriaNeural"  # edge-tts voice / piper voice path
@@ -159,6 +177,7 @@ class Config:
     tts: TTSConfig = field(default_factory=TTSConfig)
     audio: AudioConfig = field(default_factory=AudioConfig)
     aec: AECConfig = field(default_factory=AECConfig)
+    backchannel: BackchannelConfig = field(default_factory=BackchannelConfig)
     models_dir: Path = Path("models")
     stt_model: str = "base"
     stt_language: str | None = None
@@ -221,6 +240,19 @@ class Config:
                 delay_ms=_env_int("AEC_DELAY_MS", 30),
                 noise_suppression=_env_bool("AEC_NOISE_SUPPRESSION", True),
                 ns_level=_env_int("AEC_NS_LEVEL", 1),
+            ),
+            backchannel=BackchannelConfig(
+                enabled=_env_bool("BACKCHANNEL_ENABLED", False),
+                vap_bc_model=os.getenv(
+                    "VAP_BC_MODEL",
+                    "models/vap-bc_state_dict_erica_10hz_3000msec.pt",
+                ),
+                cpc_model=os.getenv("CPC_MODEL", "models/60k_epoch4-d0f474de.pt"),
+                frame_rate=_env_int("BACKCHANNEL_FRAME_RATE", 10),
+                context_len_sec=_env_float("BACKCHANNEL_CONTEXT_SEC", 3.0),
+                threshold=_env_float("BACKCHANNEL_THRESHOLD", 0.5),
+                cooldown_sec=_env_float("BACKCHANNEL_COOLDOWN_SEC", 3.0),
+                ack_text=os.getenv("BACKCHANNEL_ACK_TEXT", "Mm-hmm."),
             ),
             models_dir=models_dir,
             stt_model=os.getenv("STT_MODEL", "base"),
@@ -420,6 +452,74 @@ class WebRTCAEC:
 
     def close(self) -> None:
         self.reset()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Bot active-listening backchannels (VAP / Voice Activity Projection)
+# ─────────────────────────────────────────────────────────────────────────────
+class BotBackchannel:
+    def __init__(self, config: BackchannelConfig) -> None:
+        self.config = config
+        self._vap = None
+        self.frame_size = SAMPLE_RATE // config.frame_rate + 320
+        self._buf = np.zeros(0, dtype=np.float32)
+        self._last_ack = -1e9
+
+    def _load(self):
+        if self._vap is None:
+            from pathlib import Path
+
+            for path in (self.config.vap_bc_model, self.config.cpc_model):
+                if not Path(path).exists():
+                    raise FileNotFoundError(
+                        f"VAP model not found at {path}. Run "
+                        "`python scripts/download_models.py`."
+                    )
+            import contextlib
+            import io
+
+            from rvap.vap_bc.vap_bc_main import VAPRealTime
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                self._vap = VAPRealTime(
+                    self.config.vap_bc_model,
+                    self.config.cpc_model,
+                    "cpu",
+                    self.config.frame_rate,
+                    self.config.context_len_sec,
+                )
+        return self._vap
+
+    def load(self) -> None:
+        self._load()
+
+    def push(self, frame) -> float | None:
+        if self._vap is None:
+            self._load()
+        self._buf = np.concatenate([self._buf, np.asarray(frame, dtype=np.float32)])
+        if len(self._buf) < self.frame_size:
+            return None
+        user = np.asarray(self._buf, dtype=np.float32)[-self.frame_size:]
+        bot = np.zeros(self.frame_size, dtype=np.float32)
+        import contextlib
+        import io
+        import warnings
+
+        with contextlib.redirect_stdout(io.StringIO()), warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            self._vap.process_vap(bot, user)
+        return float(self._vap.result_p_bc_react[0])
+
+    def should_ack(self, prob, now: float) -> bool:
+        return prob is not None and prob > self.config.threshold and (
+            now - self._last_ack
+        ) > self.config.cooldown_sec
+
+    def mark_acked(self, now: float) -> None:
+        self._last_ack = now
+
+    def reset(self) -> None:
+        self._buf = np.zeros(0, dtype=np.float32)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1112,6 +1212,7 @@ class ConversationEngine:
         player: AudioPlayer,
         events: asyncio.Queue[EngineEvent],
         aec=None,
+        backchannel=None,
     ) -> None:
         self.config = config
         self.vad = vad
@@ -1122,6 +1223,7 @@ class ConversationEngine:
         self.player = player
         self.events = events
         self.aec = aec
+        self.backchannel = backchannel
         self.chat_history: list[dict[str, str]] = [
             {"role": "system", "content": SYSTEM_PROMPT}
         ]
@@ -1186,6 +1288,8 @@ class ConversationEngine:
         self.vad.silero.load()
         self.transcriber.load()
         self.tts.load()
+        if self.backchannel is not None:
+            self.backchannel.load()
 
     async def run(self) -> None:
         self.mic.start()
@@ -1209,6 +1313,16 @@ class ConversationEngine:
             self._emit(VADUpdate(result.probability, result.raw_probability))
             frame_rms = float(np.sqrt(np.mean(frame**2)))
             await self._tick(result, frame_rms)
+
+            if (
+                self.backchannel is not None
+                and self._state == "user_speaking"
+                and not self._mic_muted
+            ):
+                prob = self.backchannel.push(frame)
+                if self.backchannel.should_ack(prob, self.audio_time):
+                    self.backchannel.mark_acked(self.audio_time)
+                    await self._speak_backchannel()
 
     async def _tick(self, result, frame_rms: float = 0.0) -> None:
         if self._state == "bot_speaking":
@@ -1309,6 +1423,15 @@ class ConversationEngine:
                 self.vad.reset()
 
     async def _speak(self, text: str) -> None:
+        async for chunk in self.tts.stream(text):
+            if len(chunk):
+                if self.aec is not None:
+                    self.aec.add_reference(chunk)
+                await asyncio.to_thread(self.player.play, chunk)
+
+    async def _speak_backchannel(self) -> None:
+        self._emit(Log("backchannel"))
+        text = self.config.backchannel.ack_text
         async for chunk in self.tts.stream(text):
             if len(chunk):
                 if self.aec is not None:
@@ -1539,8 +1662,12 @@ def _make_engine(config: Config):
             noise_suppression=config.aec.noise_suppression,
             ns_level=config.aec.ns_level,
         )
+    backchannel = None
+    if config.backchannel.enabled:
+        backchannel = BotBackchannel(config.backchannel)
     return ConversationEngine(
-        config, vad, transcriber, llm, tts, mic, player, events, aec=aec
+        config, vad, transcriber, llm, tts, mic, player, events,
+        aec=aec, backchannel=backchannel,
     )
 
 
