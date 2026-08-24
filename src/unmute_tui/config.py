@@ -86,6 +86,31 @@ class VADConfig:
 
 
 @dataclass
+class TurnConfig:
+    """Turn detector selection and the LLM turn-orchestrator tuning.
+
+    `detector`:
+      - "semantic" (default): audio-only turn-end (Silero + Smart Turn v3),
+        byte-for-byte the original behavior.
+      - "llm": an LLM orchestrator continuously polls streaming partial
+        transcripts AND VAD audio cues and can commit the bot's reply early
+        (near-zero turn-end latency). The reliable audio silence timeout still
+        backstops so a stalled/empty LLM never hangs the conversation.
+    """
+
+    detector: str = "semantic"  # "semantic" | "llm"
+    # How often to re-transcribe the rolling turn buffer for partials (s).
+    partial_poll_interval_sec: float = 0.5
+    # How often to poll the LLM orchestrator while the user is speaking (s).
+    poll_interval_sec: float = 0.6
+    # Don't poll the LLM until the partial transcript is at least this long
+    # (skips short/garbage partials).
+    min_partial_chars: int = 12
+    # Trailing audio window (s) re-transcribed for each partial update.
+    stt_poll_window_sec: float = 8.0
+
+
+@dataclass
 class BackchannelConfig:
     # Bot active-listening backchannels via VAP (Voice Activity Projection).
     # When the user is speaking and VAP predicts a backchannel, the bot emits a
@@ -136,6 +161,7 @@ class Config:
     audio: AudioConfig = field(default_factory=AudioConfig)
     aec: AECConfig = field(default_factory=AECConfig)
     backchannel: BackchannelConfig = field(default_factory=BackchannelConfig)
+    turn: TurnConfig = field(default_factory=TurnConfig)
     models_dir: Path = Path("models")
     stt_model: str = "base"
     stt_language: str | None = None
@@ -217,6 +243,19 @@ class Config:
                 threshold=_env_float("BACKCHANNEL_THRESHOLD", 0.5),
                 cooldown_sec=_env_float("BACKCHANNEL_COOLDOWN_SEC", 3.0),
                 ack_text=os.getenv("BACKCHANNEL_ACK_TEXT", "Mm-hmm."),
+            ),
+            turn=TurnConfig(
+                detector=os.getenv("TURN_DETECTOR", "semantic").strip().lower(),
+                partial_poll_interval_sec=_env_float(
+                    "TURN_PARTIAL_POLL_INTERVAL_SEC", 0.5
+                ),
+                poll_interval_sec=_env_float(
+                    "TURN_ORCHESTRATOR_POLL_INTERVAL_SEC", 0.6
+                ),
+                min_partial_chars=_env_int("TURN_MIN_PARTIAL_CHARS", 12),
+                stt_poll_window_sec=_env_float(
+                    "TURN_STT_POLL_WINDOW_SEC", 8.0
+                ),
             ),
             models_dir=models_dir,
             stt_model=os.getenv("STT_MODEL", "base"),

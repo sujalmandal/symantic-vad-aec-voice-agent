@@ -84,3 +84,19 @@ class Transcriber:
         ]
         text = " ".join(s.text for s in segs).strip()
         return Transcription(text=text, segments=segs, language=info.language)
+
+    def partial(self, audio: np.ndarray, window_sec: float) -> Transcription:
+        """Transcribe a trailing window of the in-progress turn.
+
+        A lightweight, streaming-style partial: only the last `window_sec` of
+        audio is transcribed (so the transcript tracks the user's latest words),
+        using the same non-conditional batch decode as `transcribe`. The engine
+        throttles calls at `TURN_PARTIAL_POLL_INTERVAL_SEC`.
+        """
+        audio = np.asarray(audio, dtype=np.float32)
+        if audio.ndim != 1:
+            audio = audio.reshape(-1)
+        n = int(window_sec * SAMPLE_RATE)
+        if len(audio) > n:
+            audio = audio[-n:]
+        return self.transcribe(audio)

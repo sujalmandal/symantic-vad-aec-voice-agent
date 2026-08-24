@@ -14,6 +14,7 @@ from .engine import (
     EngineEvent,
     Latency,
     Log,
+    PartialUpdate,
     SessionEnd,
     StateChanged,
     UserTranscript,
@@ -69,6 +70,12 @@ class UnmuteApp(App):
             self.query_one("#state", Static).update(f"state: {event.state}")
         elif isinstance(event, VADUpdate):
             self.query_one("#vad", Static).update("vad: " + _vad_bar(event.probability))
+        elif isinstance(event, PartialUpdate):
+            # Show the latest partial transcript / orchestrator decision dimmed.
+            suffix = f" ({event.decision})" if event.decision else ""
+            self.query_one("#current", Static).update(
+                f"[dim]You: {event.text}{suffix}[/]"
+            )
         elif isinstance(event, UserTranscript):
             self.query_one("#transcript", RichLog).write(f"[bold cyan]You:[/] {event.text}")
         elif isinstance(event, AssistantDelta):

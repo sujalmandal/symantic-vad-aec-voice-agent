@@ -47,6 +47,34 @@ Turn-end detection combines two signals for reliability:
   it's confident (prob > `VAD_THRESHOLD`) after a short silence
   (`SEMANTIC_MIN_SILENCE_SEC`, 0.4s), it ends the turn sooner.
 
+### LLM turn orchestrator (optional, `TURN_DETECTOR=llm`)
+An experimental turn detector that mirrors the "continuous polling LLM" voice
+architecture: while you are speaking, the app feeds two **parallel signals** to
+an LLM **orchestrator** on every poll —
+
+- **Process A — streaming partial transcripts**: a trailing window of the
+  in-progress turn is re-transcribed (throttled at `TURN_PARTIAL_POLL_INTERVAL_SEC`)
+  so the LLM sees your latest words, not a finished sentence.
+- **Process B — VAD/audio cues**: your speech activity right now (speaking?,
+  current silence length, and the Smart Turn acoustic turn-end probability).
+
+The orchestrator decides one of three states each poll:
+
+| Decision | Meaning |
+|----------|---------|
+| `WAIT`   | You are pausing briefly; keep waiting |
+| `THINK`  | You need more time; wait patiently |
+| `RESPOND`| Text is complete AND audio shows a hand-off — speak the reply now |
+
+When it says `RESPOND` it also returns the **drafted reply**, so the bot speaks
+immediately with near-zero turn-end latency (no separate turn-end transcription
++ cold LLM generation). The reliable audio silence timeout still backstops: if
+the LLM stalls or the partial is too short, the turn ends normally.
+
+Enable it with `TURN_DETECTOR=llm`; the default `semantic` is unchanged.
+Tune with `TURN_PARTIAL_POLL_INTERVAL_SEC`, `TURN_ORCHESTRATOR_POLL_INTERVAL_SEC`,
+`TURN_MIN_PARTIAL_CHARS`, and `TURN_STT_POLL_WINDOW_SEC`.
+
 ## Requirements
 
 - macOS (Apple Silicon) or Linux, Python 3.11+
