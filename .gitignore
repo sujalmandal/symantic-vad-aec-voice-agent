@@ -16,3 +16,4 @@ models/
 
 # OS
 .DS_Store
+:memory:.ses
