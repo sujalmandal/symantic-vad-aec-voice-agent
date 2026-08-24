@@ -161,6 +161,31 @@ class AECConfig:
 
 
 @dataclass
+class STTConfig:
+    """Speech-to-text backend selection.
+
+    `backend`:
+      - "sherpa" (default): sherpa-onnx streaming Zipformer — true incremental
+        streaming, RTF ~0.03-0.05 int8 on CPU, far more accurate than whisper
+        base.
+      - "moonshine": Moonshine v2 via moonshine-voice (very low latency).
+      - "parakeet": NVIDIA Parakeet TDT-0.6B via sherpa-onnx offline recognizer
+        (best raw WER; non-streaming).
+      - "faster_whisper": the original faster-whisper backend (kept as
+        fallback); `model` selects the size (e.g. "base", "large-v3-turbo").
+    """
+
+    backend: str = "sherpa"
+    # Backend-specific model: sherpa/parakeet = model folder name under
+    # `models_dir`; faster_whisper = model size.
+    model: str = "sherpa-onnx-streaming-zipformer-en-2023-06-26"
+    language: str | None = None
+    # Directory holding the sherpa-onnx / parakeet ONNX assets.
+    models_dir: Path = Path("models/stt")
+    threads: int = 2
+
+
+@dataclass
 class Config:
     llm: LLMConfig = field(default_factory=LLMConfig)
     vad: VADConfig = field(default_factory=VADConfig)
@@ -169,9 +194,8 @@ class Config:
     aec: AECConfig = field(default_factory=AECConfig)
     backchannel: BackchannelConfig = field(default_factory=BackchannelConfig)
     turn: TurnConfig = field(default_factory=TurnConfig)
+    stt: STTConfig = field(default_factory=STTConfig)
     models_dir: Path = Path("models")
-    stt_model: str = "base"
-    stt_language: str | None = None
     debug: bool = False
 
     @classmethod
@@ -268,7 +292,16 @@ class Config:
                 ),
             ),
             models_dir=models_dir,
-            stt_model=os.getenv("STT_MODEL", "base"),
-            stt_language=os.getenv("STT_LANGUAGE") or None,
+            stt=STTConfig(
+                backend=os.getenv("STT_BACKEND", "sherpa").strip().lower(),
+                model=os.getenv(
+                    "STT_MODEL", "sherpa-onnx-streaming-zipformer-en-2023-06-26"
+                ),
+                language=os.getenv("STT_LANGUAGE") or None,
+                models_dir=Path(os.getenv("STT_MODELS_DIR", "models/stt"))
+                .expanduser()
+                .resolve(),
+                threads=_env_int("STT_THREADS", 2),
+            ),
             debug=_env_bool("DEBUG", False),
         )

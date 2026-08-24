@@ -23,12 +23,19 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Local streaming speech-to-text (faster-whisper / CTranslate2).
+# Local realtime speech-to-text backends.
+# - sherpa-onnx: streaming Zipformer (default STT_BACKEND=sherpa) + Parakeet
+# - moonshine-voice: Moonshine v2 (STT_BACKEND=moonshine)
+# - faster-whisper: legacy backend (STT_BACKEND=faster_whisper)
 stt = [
+    "sherpa-onnx>=1.10",
+    "moonshine-voice>=0.1",
     "faster-whisper>=1.0",
 ]
 # Everything.
 all = [
+    "sherpa-onnx>=1.10",
+    "moonshine-voice>=0.1",
     "faster-whisper>=1.0",
 ]
 dev = [

@@ -31,9 +31,9 @@ Terminal TUI (textual) ── asyncio events ──┐
         ┌───────────────┬──────────────────┬──────────────────┐
         ▼               ▼                  ▼                  ▼
    Audio Capture    Semantic VAD        STT (words)        LLM (OpenAI-compat)
-   (sounddevice)   Silero (activity)   faster-whisper      Ollama / cloud
-                   + Smart Turn v3     (streaming)         ──► TTS (Chatterbox)
-                   (turn-end prob)                          (streaming) ──► playback
+   (sounddevice)   Silero (activity)   sherpa-onnx         Ollama / cloud
+                   + Smart Turn v3     Zipformer           ──► TTS (Chatterbox)
+                   (turn-end prob)     (streaming)         (streaming) ──► playback
 ```
 
 ### Semantic VAD (semantic + silence)
@@ -112,7 +112,8 @@ you can run it without the package layout:
 ```bash
 # Install dependencies once
 pip install numpy sounddevice onnxruntime transformers silero-vad \
-            faster-whisper openai textual edge-tts python-dotenv kokoro-onnx mlx-audio
+            sherpa-onnx faster-whisper openai textual edge-tts \
+            python-dotenv kokoro-onnx mlx-audio
 
 # Download the VAD model, then run
 python unmute_tui.py --download-models
@@ -161,10 +162,43 @@ See [`.env.example`](.env.example). Key settings:
 - `USER_SILENCE_TIMEOUT` — seconds before the `"..."` marker (default `7.0`).
 - `UNINTERRUPTIBLE_BY_VAD_TIME_SEC` — bot's protected window at turn start
   (default `0.3`). Barge-in is live after this.
-- `STT_MODEL` — faster-whisper size (`tiny`/`base`/`small`/`medium`).
+- `STT_BACKEND` / `STT_MODEL` / `STT_MODELS_DIR` / `STT_THREADS` — STT backend
+  selection and model path (see [Speech-to-text backends](#speech-to-text-backends)).
 - `AEC_ENABLED` / `AEC_DELAY_MS` / `AEC_NOISE_SUPPRESSION` — WebRTC AEC3
   echo cancellation (removes the bot's own TTS echo from the mic so full-duplex
   barge-in works even without headphones). On by default.
+
+## Speech-to-text backends
+
+The app ships with pluggable, fully local STT backends (select with `STT_BACKEND`):
+
+| `STT_BACKEND` | Model | Streaming | Speed (local CPU) | Accuracy |
+|---|---|---|---|---|
+| `sherpa` (default) | sherpa-onnx streaming Zipformer ([docs](https://k2-fsa.github.io/sherpa/onnx/pretrained_models/online-transducer/zipformer-transducer-models.html)) | ✅ true incremental partials | RTF ≈ 0.03–0.05 int8 (~20–30× realtime) | strong conversational WER |
+| `moonshine` | Moonshine v2 ([repo](https://github.com/moonshine-ai/moonshine)) | ✅ streaming | very low latency (~150 ms Small) | competitive with Whisper Large V3 |
+| `parakeet` | NVIDIA Parakeet TDT-0.6B ([sherpa-onnx ONNX](https://github.com/mil-ad/parakeet-tdt-0.6b-v3-fastapi-openai)) | ❌ offline (fast) | RTF ≈ 0.05 | best raw WER (LS-clean ~2.2%) |
+| `faster_whisper` | faster-whisper `base`/`large-v3-turbo` | ❌ batch/windowed | — | lower than the above |
+
+Why `sherpa` is the default: it is the only backend with **true streaming**
+decoding — mic frames are fed as they arrive and `partial()` returns the words
+as they are spoken — so the LLM turn orchestrator sees the transcript with
+essentially zero extra latency, and it is far more accurate than the old
+whisper `base` on spontaneous speech (the "misunderstood words" problem).
+
+Setup (after `uv sync --extra stt`):
+
+```bash
+uv run python scripts/download_models.py   # fetches the Zipformer (and Parakeet) models
+uv run unmute-tui                          # default STT_BACKEND=sherpa
+```
+
+Swap backends via `.env`:
+
+```bash
+STT_BACKEND=moonshine          # or sherpa | parakeet | faster_whisper
+STT_MODELS_DIR=models/stt      # sherpa/parakeet ONNX assets
+STT_THREADS=2                  # decoder threads
+```
 
 ## Acoustic echo cancellation (AEC)
 

@@ -11,7 +11,9 @@ def test_defaults(monkeypatch):
     assert cfg.llm.base_url == "http://localhost:11434/v1"
     assert cfg.vad.threshold == 0.6
     assert cfg.tts.backend == "chatterbox"
-    assert cfg.stt_model == "base"
+    assert cfg.stt.backend == "sherpa"
+    assert cfg.stt.model == "sherpa-onnx-streaming-zipformer-en-2023-06-26"
+    assert cfg.stt.threads == 2
     assert cfg.turn.detector == "semantic"
     assert cfg.turn.min_partial_chars == 12
     # Barge-in is live by default in all configs (no mic muting).
@@ -26,6 +28,7 @@ def test_env_override(monkeypatch):
     monkeypatch.setenv("LLM_MODEL", "gpt-4o")
     monkeypatch.setenv("VAD_THRESHOLD", "0.7")
     monkeypatch.setenv("TTS_BACKEND", "edge")
+    monkeypatch.setenv("STT_BACKEND", "faster_whisper")
     monkeypatch.setenv("STT_MODEL", "small")
     monkeypatch.setenv("TURN_DETECTOR", "llm")
     monkeypatch.setenv("TURN_MIN_PARTIAL_CHARS", "5")
@@ -35,6 +38,7 @@ def test_env_override(monkeypatch):
     assert cfg.llm.model == "gpt-4o"
     assert cfg.vad.threshold == 0.7
     assert cfg.tts.backend == "edge"
-    assert cfg.stt_model == "small"
+    assert cfg.stt.backend == "faster_whisper"
+    assert cfg.stt.model == "small"
     assert cfg.turn.detector == "llm"
     assert cfg.turn.min_partial_chars == 5

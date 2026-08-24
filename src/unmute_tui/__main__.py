@@ -17,7 +17,7 @@ from .audio import AudioPlayer, Microphone, list_devices
 from .config import Config
 from .engine import ConversationEngine
 from .llm import LLM
-from .stt import Transcriber
+from .stt import create_transcriber
 from .tts import create_tts
 from .turn import LLMTurnOrchestrator
 from .vad import SemanticVAD
@@ -42,10 +42,7 @@ def build_engine(config: Config):
         turn_end_silence_sec=config.vad.turn_end_silence_sec,
         semantic_min_silence_sec=config.vad.semantic_min_silence_sec,
     )
-    transcriber = Transcriber(
-        model_size=config.stt_model,
-        language=config.stt_language,
-    )
+    transcriber = create_transcriber(config.stt)
     llm = LLM(config.llm)
     tts = create_tts(config.tts)
     mic = Microphone(device=config.audio.input_device)

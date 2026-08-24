@@ -237,6 +237,11 @@ class ConversationEngine:
             frame_rms = float(np.sqrt(np.mean(frame**2)))
             await self._tick(result, frame_rms)
 
+            # Feed the user's audio to a streaming STT backend while speaking,
+            # so partial transcripts track the in-progress turn (no re-window).
+            if self._state == "user_speaking" and not self._mic_muted:
+                self.transcriber.push(frame)
+
             # Active-listening backchannels: while the user is speaking, if VAP
             # predicts a backchannel, the bot emits a short ack without taking
             # the turn (state stays user_speaking).
@@ -304,6 +309,9 @@ class ConversationEngine:
 
     async def _handle_turn_end(self, audio: np.ndarray | None) -> None:
         self._set_state("user_speaking")
+        # The user's turn is over: start a fresh STT turn so the next utterance
+        # doesn't carry over stale streaming state.
+        self.transcriber.reset()
         if audio is None or len(audio) == 0:
             self._set_state("waiting_for_user")
             self.waiting_for_user_start = self.audio_time
@@ -381,6 +389,7 @@ class ConversationEngine:
             return
         # Consume the current turn recording so it isn't re-processed.
         self.vad.reset()
+        self.transcriber.reset()  # fresh STT turn for the next utterance
         user_text = result.partial.strip() or self._partial_text
         if user_text:
             self._add_message("user", user_text)
@@ -509,6 +518,7 @@ class ConversationEngine:
         # Start a fresh VAD turn so the user's barge-in speech (not the bot's
         # echo) is what gets transcribed.
         self.vad.reset()
+        self.transcriber.reset()  # fresh STT turn for the barge-in utterance
         self._barge_in_frames = 0
         if self._assistant_text:
             self._set_last_message(

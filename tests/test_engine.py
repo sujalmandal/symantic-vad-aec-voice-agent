@@ -51,6 +51,12 @@ class FakeTranscriber:
     def load(self):
         pass
 
+    def push(self, frame):
+        pass
+
+    def reset(self):
+        pass
+
     def transcribe(self, audio):
         from unmute_tui.stt import Transcription
 
