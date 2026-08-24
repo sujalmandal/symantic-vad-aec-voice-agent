@@ -20,7 +20,7 @@ SAMPLES_PER_FRAME = int(SAMPLE_RATE * FRAME_TIME_SEC)  # 320
 # Defaults mirroring unmute.sh.
 DEFAULT_VAD_THRESHOLD = 0.6
 DEFAULT_USER_SILENCE_TIMEOUT = 7.0
-DEFAULT_UNINTERRUPTIBLE_BY_VAD_TIME_SEC = 3.0
+DEFAULT_UNINTERRUPTIBLE_BY_VAD_TIME_SEC = 0.3
 
 # Semantic VAD: how long a turn recording is kept for Smart Turn (seconds).
 SMART_TURN_WINDOW_SEC = 8.0
@@ -79,10 +79,17 @@ class VADConfig:
     # Consecutive (energy-gated) speech frames required to trigger barge-in in
     # the bot's turn. The echo residual is intermittent; real speech is sustained.
     barge_in_required_frames: int = 15
-    # Mute the mic while the bot is speaking. Without echo cancellation (e.g.
-    # when not on headphones) the bot would hear its own TTS and interrupt
-    # itself. Disable to allow barge-in (requires headphones/echo cancellation).
-    mute_mic_while_bot_speaking: bool = True
+    # No-AEC barge-in margin (dB): without echo cancellation, a mic frame only
+    # counts as the user when it is at least this much louder than the bot's
+    # recent playback. The bot's own TTS echo sits at ~the playback level, so
+    # this lets a user speaking over the bot interrupt it while preventing the
+    # bot from interrupting itself.
+    barge_in_over_playback_db: float = 6.0
+    # Mute the mic while the bot is speaking (half-duplex). Disabled by default
+    # so barge-in is live in all configs; the playback-aware echo gate keeps the
+    # bot from interrupting itself when AEC is unavailable. Enable only if you
+    # want a guaranteed no-self-reply half-duplex mode.
+    mute_mic_while_bot_speaking: bool = False
 
 
 @dataclass
@@ -199,8 +206,11 @@ class Config:
                 barge_in_required_frames=_env_int(
                     "BARGE_IN_REQUIRED_FRAMES", 15
                 ),
+                barge_in_over_playback_db=_env_float(
+                    "BARGE_IN_OVER_PLAYBACK_DB", 6.0
+                ),
                 mute_mic_while_bot_speaking=_env_bool(
-                    "MUTE_MIC_WHILE_BOT_SPEAKING", True
+                    "MUTE_MIC_WHILE_BOT_SPEAKING", False
                 ),
             ),
             tts=TTSConfig(

@@ -17,6 +17,7 @@ import numpy as np
 
 from .audio import AudioPlayer, Microphone
 from .config import FRAME_TIME_SEC, SAMPLE_RATE, Config
+from .echogate import PlaybackEchoGate
 from .llm import INTERRUPTION_CHAR, USER_SILENCE_MARKER, LLM, rechunk_to_words
 from .prompts import SYSTEM_PROMPT
 from .stt import Transcriber
@@ -140,6 +141,11 @@ class ConversationEngine:
         self._mic_muted = False
         self._partial_text = ""
         self._orchestrator_task: asyncio.Task | None = None
+        # Playback-aware echo gate: keeps the bot from interrupting itself with
+        # its own TTS echo when AEC is unavailable (barge-in without AEC).
+        self.echo_gate = PlaybackEchoGate(
+            margin_db=config.vad.barge_in_over_playback_db
+        )
 
     # ── helpers ────────────────────────────────────────────────────────────
     def _emit(self, event: EngineEvent) -> None:
@@ -244,14 +250,29 @@ class ConversationEngine:
                     self.backchannel.mark_acked(self.audio_time)
                     await self._speak_backchannel()
 
+    def _is_user_bargein(self, frame_rms: float) -> bool:
+        """Whether a mic frame while the bot speaks is the user (not its echo).
+
+        With AEC, the cleaned frame's energy above the floor is the user's voice.
+        Without AEC, we also require the frame to be clearly louder than what the
+        bot has just been playing (the playback-aware echo gate), so the bot's own
+        TTS echo never makes it interrupt itself.
+        """
+        if not self.vad.is_speaking:
+            return False
+        if frame_rms < self.config.vad.barge_in_min_rms:
+            return False
+        if self.aec is not None:
+            return True
+        return frame_rms >= self.echo_gate.threshold()
+
     async def _tick(self, result, frame_rms: float = 0.0) -> None:
         if self._state == "bot_speaking":
             # Barge-in: the user starts talking over the bot. Only count a frame
-            # as the user when it is above the barge-in energy floor: the AEC
-            # leaves a low-energy residual of the bot's own voice, which we must
-            # not treat as a barge-in (or the bot interrupts itself). Louder,
-            # sustained real user speech still triggers barge-in.
-            if self.vad.is_speaking and frame_rms >= self.config.vad.barge_in_min_rms:
+            # as the user when it is genuinely the user (see _is_user_bargein):
+            # with AEC the echo is cancelled; without AEC we gate against the
+            # bot's own playback. Louder, sustained user speech triggers barge-in.
+            if self._is_user_bargein(frame_rms):
                 self._barge_in_frames += 1
             else:
                 self._barge_in_frames = 0
@@ -447,6 +468,7 @@ class ConversationEngine:
     async def _speak(self, text: str) -> None:
         async for chunk in self.tts.stream(text):
             if len(chunk):
+                self.echo_gate.add_playback(chunk)
                 if self.aec is not None:
                     # Feed the TTS audio as the far-end reference so the AEC can
                     # remove it from the mic signal.
@@ -464,6 +486,7 @@ class ConversationEngine:
         text = self.config.backchannel.ack_text
         async for chunk in self.tts.stream(text):
             if len(chunk):
+                self.echo_gate.add_playback(chunk)
                 if self.aec is not None:
                     self.aec.add_reference(chunk)
                 await asyncio.to_thread(self.player.play, chunk)
@@ -482,6 +505,7 @@ class ConversationEngine:
         self.player.clear()
         if self.aec is not None:
             self.aec.reset()  # clear stale far-end reference on barge-in
+        self.echo_gate.reset()  # clear the bot's own playback history
         # Start a fresh VAD turn so the user's barge-in speech (not the bot's
         # echo) is what gets transcribed.
         self.vad.reset()

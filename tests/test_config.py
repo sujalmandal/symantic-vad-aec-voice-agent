@@ -14,6 +14,10 @@ def test_defaults(monkeypatch):
     assert cfg.stt_model == "base"
     assert cfg.turn.detector == "semantic"
     assert cfg.turn.min_partial_chars == 12
+    # Barge-in is live by default in all configs (no mic muting).
+    assert cfg.vad.mute_mic_while_bot_speaking is False
+    assert cfg.vad.uninterruptible_by_vad_time_sec == 0.3
+    assert cfg.vad.barge_in_over_playback_db == 6.0
 
 
 def test_env_override(monkeypatch):

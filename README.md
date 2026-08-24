@@ -147,12 +147,20 @@ See [`.env.example`](.env.example). Key settings:
   least `BARGE_IN_MIN_RMS` and sustained for `BARGE_IN_REQUIRED_FRAMES`. This
   ignores the AEC's low-level echo residual so the bot doesn't interrupt itself;
   louder real user speech still barges in.
+- `BARGE_IN_OVER_PLAYBACK_DB` — no-AEC barge-in margin: when echo cancellation
+  is unavailable, a mic frame only counts as the user if it is this much louder
+  than the bot's recent playback, so the bot never interrupts itself with its
+  own TTS echo. Default `6.0` dB.
+- `MUTE_MIC_WHILE_BOT_SPEAKING` — half-duplex mode (mutes the mic while the bot
+  speaks; guarantees no self-reply but disables barge-in). **Off by default** so
+  barge-in is live in all configs.
 - `BACKCHANNEL_ENABLED` / `VAP_BC_MODEL` / `CPC_MODEL` / `BACKCHANNEL_THRESHOLD`
   / `BACKCHANNEL_COOLDOWN_SEC` / `BACKCHANNEL_ACK_TEXT` — active-listening
   backchannels: while the user is speaking, VAP predicts when to backchannel and
   the bot emits a short ack ("Mm-hmm") without taking the turn. Off by default.
 - `USER_SILENCE_TIMEOUT` — seconds before the `"..."` marker (default `7.0`).
-- `UNINTERRUPTIBLE_BY_VAD_TIME_SEC` — bot's protected window at turn start.
+- `UNINTERRUPTIBLE_BY_VAD_TIME_SEC` — bot's protected window at turn start
+  (default `0.3`). Barge-in is live after this.
 - `STT_MODEL` — faster-whisper size (`tiny`/`base`/`small`/`medium`).
 - `AEC_ENABLED` / `AEC_DELAY_MS` / `AEC_NOISE_SUPPRESSION` — WebRTC AEC3
   echo cancellation (removes the bot's own TTS echo from the mic so full-duplex
@@ -173,12 +181,22 @@ same algorithm Chrome uses) to remove the echo:
 - `AEC_NOISE_SUPPRESSION=true` (default) — WebRTC noise suppression on top of
   AEC, so background noise isn't transcribed as a user turn.
 
-If AEC is disabled (`AEC_ENABLED=false`), the app falls back to muting the mic
-while the bot speaks (`MUTE_MIC_WHILE_BOT_SPEAKING=true`) — the reliable
-half-duplex mode that guarantees no self-reply.
-
 No model download or C++ build is needed — AEC3 ships with the
 `pywebrtc-audio` wheel (`pip install pywebrtc-audio`).
+
+### Barge-in without AEC
+
+If AEC is unavailable (`AEC_ENABLED=false` or `pywebrtc-audio` not installed),
+barge-in still works via a **playback-aware echo gate**: the app remembers how
+loud the bot's TTS just was and only treats a mic frame as *you* when it is
+`BARGE_IN_OVER_PLAYBACK_DB` louder than that recent playback. Your voice speaking
+over the bot interrupts it; the bot's own echo never makes it interrupt itself.
+
+- To force the old guaranteed half-duplex behavior instead (mute the mic while
+  the bot speaks), set `MUTE_MIC_WHILE_BOT_SPEAKING=true`.
+- Without AEC, a little of the bot's echo can still leak into the next turn's
+  recording (inherent — there's no true echo cancellation). AEC remains
+  recommended for the cleanest transcription.
 
 ## Backchannels (active listening)
 
