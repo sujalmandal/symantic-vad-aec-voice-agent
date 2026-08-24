@@ -81,6 +81,20 @@ class SemanticVAD:
         """Whether the user is currently speaking (last frame was speech)."""
         return self._was_speaking
 
+    @property
+    def silence_frames(self) -> int:
+        """Consecutive silence frames since the last speech frame."""
+        return self._silence_frames
+
+    def get_turn_audio(self) -> np.ndarray:
+        """The raw 16 kHz mono audio accumulated so far for the current turn.
+
+        Exposes the already-buffered turn recording so the orchestrator can
+        sample streaming partial transcripts without a second recorder. Returns
+        an empty array before any speech.
+        """
+        return self._turn_audio()
+
     def reset(self) -> None:
         """Start a fresh turn (called after a turn-end is consumed)."""
         self._turn_buffer = []

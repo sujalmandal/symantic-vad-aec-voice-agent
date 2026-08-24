@@ -16,11 +16,13 @@ from typing import AsyncIterator
 import numpy as np
 
 from .audio import AudioPlayer, Microphone
-from .config import SAMPLE_RATE, Config
+from .config import FRAME_TIME_SEC, SAMPLE_RATE, Config
+from .echogate import PlaybackEchoGate
 from .llm import INTERRUPTION_CHAR, USER_SILENCE_MARKER, LLM, rechunk_to_words
 from .prompts import SYSTEM_PROMPT
 from .stt import Transcriber
 from .tts import TTSBackend
+from .turn import TurnDecision, TurnResult, VADState
 from .vad import SemanticVAD
 
 # Sentence-ending punctuation that triggers incremental TTS synthesis.
@@ -38,6 +40,14 @@ class StateChanged:
 class VADUpdate:
     probability: float
     raw_probability: float | None
+
+
+@dataclass
+class PartialUpdate:
+    """A new partial transcript and/or the orchestrator's latest decision."""
+
+    text: str
+    decision: str = ""
 
 
 @dataclass
@@ -74,6 +84,7 @@ class SessionEnd:
 EngineEvent = (
     StateChanged
     | VADUpdate
+    | PartialUpdate
     | UserTranscript
     | AssistantDelta
     | AssistantDone
@@ -95,6 +106,8 @@ class ConversationEngine:
         player: AudioPlayer,
         events: asyncio.Queue[EngineEvent],
         aec=None,  # optional WebRTCAEC
+        backchannel=None,  # optional BotBackchannel
+        orchestrator=None,  # optional LLMTurnOrchestrator
     ) -> None:
         self.config = config
         self.vad = vad
@@ -105,6 +118,8 @@ class ConversationEngine:
         self.player = player
         self.events = events
         self.aec = aec
+        self.backchannel = backchannel
+        self.orchestrator = orchestrator
 
         self.chat_history: list[dict[str, str]] = [
             {"role": "system", "content": SYSTEM_PROMPT}
@@ -121,9 +136,16 @@ class ConversationEngine:
         # Consecutive speech frames required to trigger barge-in (reduces
         # echo-triggered self-interruption, since echo is usually intermittent).
         self._barge_in_frames = 0
-        self._barge_in_required = 10  # ~200 ms of sustained speech
+        self._barge_in_required = config.vad.barge_in_required_frames
         self._silence_count = 0
         self._mic_muted = False
+        self._partial_text = ""
+        self._orchestrator_task: asyncio.Task | None = None
+        # Playback-aware echo gate: keeps the bot from interrupting itself with
+        # its own TTS echo when AEC is unavailable (barge-in without AEC).
+        self.echo_gate = PlaybackEchoGate(
+            margin_db=config.vad.barge_in_over_playback_db
+        )
 
     # ── helpers ────────────────────────────────────────────────────────────
     def _emit(self, event: EngineEvent) -> None:
@@ -175,6 +197,8 @@ class ConversationEngine:
         self.vad.silero.load()
         self.transcriber.load()
         self.tts.load()
+        if self.backchannel is not None:
+            self.backchannel.load()
 
     async def run(self) -> None:
         self.mic.start()
@@ -186,6 +210,13 @@ class ConversationEngine:
         # Bot greets first so the user hears the TTS working.
         self._add_message("user", "Hello!")
         await self._generate_response()
+
+        # LLM turn orchestrator: a background loop that, while the user is
+        # speaking, polls partial transcripts + VAD cues and may commit the
+        # bot's reply early (near-zero turn-end latency).
+        if self.orchestrator is not None and self.config.turn.detector == "llm":
+            self._emit(Log("LLM turn orchestrator active (TURN_DETECTOR=llm)."))
+            self._orchestrator_task = asyncio.create_task(self._orchestrator_loop())
 
         async for frame in self.mic.frames():
             self.n_samples_received += len(frame)
@@ -203,13 +234,45 @@ class ConversationEngine:
                 frame = clean
             result = self.vad.process_frame(frame)
             self._emit(VADUpdate(result.probability, result.raw_probability))
-            await self._tick(result)
+            frame_rms = float(np.sqrt(np.mean(frame**2)))
+            await self._tick(result, frame_rms)
 
-    async def _tick(self, result) -> None:
+            # Active-listening backchannels: while the user is speaking, if VAP
+            # predicts a backchannel, the bot emits a short ack without taking
+            # the turn (state stays user_speaking).
+            if (
+                self.backchannel is not None
+                and self._state == "user_speaking"
+                and not self._mic_muted
+            ):
+                prob = self.backchannel.push(frame)
+                if self.backchannel.should_ack(prob, self.audio_time):
+                    self.backchannel.mark_acked(self.audio_time)
+                    await self._speak_backchannel()
+
+    def _is_user_bargein(self, frame_rms: float) -> bool:
+        """Whether a mic frame while the bot speaks is the user (not its echo).
+
+        With AEC, the cleaned frame's energy above the floor is the user's voice.
+        Without AEC, we also require the frame to be clearly louder than what the
+        bot has just been playing (the playback-aware echo gate), so the bot's own
+        TTS echo never makes it interrupt itself.
+        """
+        if not self.vad.is_speaking:
+            return False
+        if frame_rms < self.config.vad.barge_in_min_rms:
+            return False
+        if self.aec is not None:
+            return True
+        return frame_rms >= self.echo_gate.threshold()
+
+    async def _tick(self, result, frame_rms: float = 0.0) -> None:
         if self._state == "bot_speaking":
-            # Barge-in: the user starts talking over the bot. Require sustained
-            # speech so the bot's own echo doesn't interrupt it.
-            if self.vad.is_speaking:
+            # Barge-in: the user starts talking over the bot. Only count a frame
+            # as the user when it is genuinely the user (see _is_user_bargein):
+            # with AEC the echo is cancelled; without AEC we gate against the
+            # bot's own playback. Louder, sustained user speech triggers barge-in.
+            if self._is_user_bargein(frame_rms):
                 self._barge_in_frames += 1
             else:
                 self._barge_in_frames = 0
@@ -255,6 +318,102 @@ class ConversationEngine:
         self._emit(UserTranscript(text))
         self._silence_count = 0
         await self._generate_response()
+
+    # ── LLM turn orchestrator ───────────────────────────────────────────────
+    async def _orchestrator_loop(self) -> None:
+        """Background loop: while the user is speaking, poll the LLM turn
+        detector and commit the bot's reply when it says RESPOND."""
+        cfg = self.config.turn
+        try:
+            while True:
+                await asyncio.sleep(cfg.poll_interval_sec)
+                if self._state != "user_speaking":
+                    continue
+                await self._poll_orchestrator()
+        except asyncio.CancelledError:
+            raise
+
+    async def _poll_orchestrator(self) -> None:
+        """Sample the current partial transcript + VAD state and poll the LLM."""
+        if self._state != "user_speaking":
+            return
+        audio = self.vad.get_turn_audio()
+        if len(audio) == 0:
+            return
+        partial = (
+            await asyncio.to_thread(
+                self.transcriber.partial,
+                audio,
+                self.config.turn.stt_poll_window_sec,
+            )
+        ).text.strip()
+        if len(partial) < self.config.turn.min_partial_chars:
+            return
+        if partial == self._partial_text:
+            return  # no new text since the last poll
+        self._partial_text = partial
+        self._emit(PartialUpdate(partial, ""))
+
+        vad_state = VADState(
+            speaking=self.vad.is_speaking,
+            silence_seconds=self.vad.silence_frames * FRAME_TIME_SEC,
+            smart_turn_probability=self.vad.probability,
+            turn_seconds=self.audio_time,
+        )
+        context = self.orchestrator.orchestration_context(self.chat_history)
+        result = await self.orchestrator.decide(partial, vad_state, context)
+        self._emit(PartialUpdate(partial, result.decision.value))
+        if result.decision == TurnDecision.RESPOND:
+            await self._commit_orchestrated_turn(result)
+
+    async def _commit_orchestrated_turn(self, result: TurnResult) -> None:
+        """End the user's turn via the orchestrator and speak the reply.
+
+        The reply was already drafted by the orchestrator, so there is no
+        separate turn-end transcription + cold LLM generation — this is the
+        near-zero-latency path. If no usable reply came back, we simply do
+        nothing and let the audio silence timeout end the turn normally.
+        """
+        if self._state != "user_speaking":
+            return
+        text = result.response.strip()
+        if not text:
+            return
+        # Consume the current turn recording so it isn't re-processed.
+        self.vad.reset()
+        user_text = result.partial.strip() or self._partial_text
+        if user_text:
+            self._add_message("user", user_text)
+            self._emit(UserTranscript(user_text))
+        self._silence_count = 0
+        self._assistant_text = text
+        self._set_last_message("assistant", text)
+        self._emit(AssistantDone(text))
+        self._set_state("bot_speaking")
+        self.uninterruptible_until = (
+            self.audio_time + self.config.vad.uninterruptible_by_vad_time_sec
+        )
+        if self.config.vad.mute_mic_while_bot_speaking and self.aec is None:
+            self._mic_muted = True
+        self._response_task = asyncio.create_task(self._speak_committed(text))
+
+    async def _speak_committed(self, text: str) -> None:
+        """Play an orchestrator-committed reply, then return to waiting."""
+        try:
+            await self._speak(text)
+            if text.endswith("Bye!"):
+                self._emit(SessionEnd("assistant said goodbye"))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            self._emit(Log(f"TTS error: {exc}"))
+        finally:
+            if not self._interrupted:
+                self._set_state("waiting_for_user")
+                self.waiting_for_user_start = self.audio_time
+            if self.config.vad.mute_mic_while_bot_speaking and self.aec is None:
+                self._mic_muted = False
+                self.vad.reset()
 
     # ── response generation ────────────────────────────────────────────────
     async def _generate_response(self) -> None:
@@ -309,9 +468,26 @@ class ConversationEngine:
     async def _speak(self, text: str) -> None:
         async for chunk in self.tts.stream(text):
             if len(chunk):
+                self.echo_gate.add_playback(chunk)
                 if self.aec is not None:
                     # Feed the TTS audio as the far-end reference so the AEC can
                     # remove it from the mic signal.
+                    self.aec.add_reference(chunk)
+                await asyncio.to_thread(self.player.play, chunk)
+
+    async def _speak_backchannel(self) -> None:
+        """Emit a short backchannel ack ("Mm-hmm") while the user is speaking.
+
+        Does NOT advance the conversation state (the user keeps their turn);
+        the ack audio is fed to the AEC as reference so it isn't misheard as
+        the user.
+        """
+        self._emit(Log("backchannel"))
+        text = self.config.backchannel.ack_text
+        async for chunk in self.tts.stream(text):
+            if len(chunk):
+                self.echo_gate.add_playback(chunk)
+                if self.aec is not None:
                     self.aec.add_reference(chunk)
                 await asyncio.to_thread(self.player.play, chunk)
 
@@ -329,6 +505,7 @@ class ConversationEngine:
         self.player.clear()
         if self.aec is not None:
             self.aec.reset()  # clear stale far-end reference on barge-in
+        self.echo_gate.reset()  # clear the bot's own playback history
         # Start a fresh VAD turn so the user's barge-in speech (not the bot's
         # echo) is what gets transcribed.
         self.vad.reset()
@@ -341,6 +518,12 @@ class ConversationEngine:
         self._set_state("user_speaking")
 
     async def shutdown(self) -> None:
+        if self._orchestrator_task is not None:
+            self._orchestrator_task.cancel()
+            try:
+                await self._orchestrator_task
+            except (asyncio.CancelledError, Exception):
+                pass
         if self._response_task is not None:
             self._response_task.cancel()
             try:

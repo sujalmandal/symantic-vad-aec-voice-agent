@@ -19,6 +19,7 @@ from .engine import ConversationEngine
 from .llm import LLM
 from .stt import Transcriber
 from .tts import create_tts
+from .turn import LLMTurnOrchestrator
 from .vad import SemanticVAD
 from .vad.silero_vad import SileroVAD
 from .vad.smart_turn import SmartTurn
@@ -58,6 +59,7 @@ async def _headless(config: Config, engine: ConversationEngine) -> None:
         AssistantDelta,
         AssistantDone,
         Log,
+        PartialUpdate,
         SessionEnd,
         StateChanged,
         UserTranscript,
@@ -71,7 +73,11 @@ async def _headless(config: Config, engine: ConversationEngine) -> None:
             ev = await events.get()
             if isinstance(ev, VADUpdate):
                 continue  # too noisy
-            if isinstance(ev, AssistantDelta):
+            if isinstance(ev, PartialUpdate):
+                if config.debug:
+                    suffix = f" [{ev.decision}]" if ev.decision else ""
+                    print(f"\n[partial] {ev.text}{suffix}")
+            elif isinstance(ev, AssistantDelta):
                 print(ev.text, end="", flush=True)
             elif isinstance(ev, AssistantDone):
                 print()
@@ -105,8 +111,17 @@ def _make_engine(config: Config) -> ConversationEngine:
             noise_suppression=config.aec.noise_suppression,
             ns_level=config.aec.ns_level,
         )
+    backchannel = None
+    if config.backchannel.enabled:
+        from .backchannel import BotBackchannel
+
+        backchannel = BotBackchannel(config.backchannel)
+    orchestrator = None
+    if config.turn.detector == "llm":
+        orchestrator = LLMTurnOrchestrator(llm)
     return ConversationEngine(
-        config, vad, transcriber, llm, tts, mic, player, events, aec=aec
+        config, vad, transcriber, llm, tts, mic, player, events,
+        aec=aec, backchannel=backchannel, orchestrator=orchestrator,
     )
 
 

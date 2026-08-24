@@ -179,3 +179,25 @@ async def test_goodbye_emits_session_end():
     while not events.empty():
         seen.append(events.get_nowait())
     assert any(isinstance(e, SessionEnd) for e in seen)
+
+
+@pytest.mark.asyncio
+async def test_barge_in_energy_gate_blocks_echo_residual():
+    # The AEC leaves a low-energy residual of the bot's own voice that Silero
+    # may flag as speech. The energy gate must ignore it so the bot doesn't
+    # interrupt itself, while real (louder) user speech still barges in.
+    vad = FakeVAD(is_speaking=True)  # Silero says "speaking" for every frame
+    engine, events = _make_engine(vad)
+    engine._set_state("bot_speaking")
+    engine.uninterruptible_until = -1.0  # allow barge-in immediately
+
+    # Low-RMS frames (echo residual) must NOT accumulate into a barge-in.
+    for _ in range(engine._barge_in_required + 5):
+        await engine._tick(TurnEndResult(False, 0.0, None), frame_rms=0.001)
+    assert engine._state == "bot_speaking"
+    assert engine._barge_in_frames == 0
+
+    # High-RMS frames (real user speech) must accumulate and trigger barge-in.
+    for _ in range(engine._barge_in_required):
+        await engine._tick(TurnEndResult(False, 0.0, None), frame_rms=0.1)
+    assert engine._state == "user_speaking"

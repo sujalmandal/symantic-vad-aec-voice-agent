@@ -47,6 +47,34 @@ Turn-end detection combines two signals for reliability:
   it's confident (prob > `VAD_THRESHOLD`) after a short silence
   (`SEMANTIC_MIN_SILENCE_SEC`, 0.4s), it ends the turn sooner.
 
+### LLM turn orchestrator (optional, `TURN_DETECTOR=llm`)
+An experimental turn detector that mirrors the "continuous polling LLM" voice
+architecture: while you are speaking, the app feeds two **parallel signals** to
+an LLM **orchestrator** on every poll —
+
+- **Process A — streaming partial transcripts**: a trailing window of the
+  in-progress turn is re-transcribed (throttled at `TURN_PARTIAL_POLL_INTERVAL_SEC`)
+  so the LLM sees your latest words, not a finished sentence.
+- **Process B — VAD/audio cues**: your speech activity right now (speaking?,
+  current silence length, and the Smart Turn acoustic turn-end probability).
+
+The orchestrator decides one of three states each poll:
+
+| Decision | Meaning |
+|----------|---------|
+| `WAIT`   | You are pausing briefly; keep waiting |
+| `THINK`  | You need more time; wait patiently |
+| `RESPOND`| Text is complete AND audio shows a hand-off — speak the reply now |
+
+When it says `RESPOND` it also returns the **drafted reply**, so the bot speaks
+immediately with near-zero turn-end latency (no separate turn-end transcription
++ cold LLM generation). The reliable audio silence timeout still backstops: if
+the LLM stalls or the partial is too short, the turn ends normally.
+
+Enable it with `TURN_DETECTOR=llm`; the default `semantic` is unchanged.
+Tune with `TURN_PARTIAL_POLL_INTERVAL_SEC`, `TURN_ORCHESTRATOR_POLL_INTERVAL_SEC`,
+`TURN_MIN_PARTIAL_CHARS`, and `TURN_STT_POLL_WINDOW_SEC`.
+
 ## Requirements
 
 - macOS (Apple Silicon) or Linux, Python 3.11+
@@ -114,8 +142,25 @@ See [`.env.example`](.env.example). Key settings:
 - `VAD_THRESHOLD` — semantic turn-end probability threshold (default `0.6`).
 - `TURN_END_SILENCE_SEC` / `SEMANTIC_MIN_SILENCE_SEC` — turn-end silence
   (reliable fallback) and semantic accelerator silence.
+- `BARGE_IN_MIN_RMS` / `BARGE_IN_REQUIRED_FRAMES` — barge-in robustness: while
+  the bot speaks, only treat the mic as the user if its AEC-cleaned RMS is at
+  least `BARGE_IN_MIN_RMS` and sustained for `BARGE_IN_REQUIRED_FRAMES`. This
+  ignores the AEC's low-level echo residual so the bot doesn't interrupt itself;
+  louder real user speech still barges in.
+- `BARGE_IN_OVER_PLAYBACK_DB` — no-AEC barge-in margin: when echo cancellation
+  is unavailable, a mic frame only counts as the user if it is this much louder
+  than the bot's recent playback, so the bot never interrupts itself with its
+  own TTS echo. Default `6.0` dB.
+- `MUTE_MIC_WHILE_BOT_SPEAKING` — half-duplex mode (mutes the mic while the bot
+  speaks; guarantees no self-reply but disables barge-in). **Off by default** so
+  barge-in is live in all configs.
+- `BACKCHANNEL_ENABLED` / `VAP_BC_MODEL` / `CPC_MODEL` / `BACKCHANNEL_THRESHOLD`
+  / `BACKCHANNEL_COOLDOWN_SEC` / `BACKCHANNEL_ACK_TEXT` — active-listening
+  backchannels: while the user is speaking, VAP predicts when to backchannel and
+  the bot emits a short ack ("Mm-hmm") without taking the turn. Off by default.
 - `USER_SILENCE_TIMEOUT` — seconds before the `"..."` marker (default `7.0`).
-- `UNINTERRUPTIBLE_BY_VAD_TIME_SEC` — bot's protected window at turn start.
+- `UNINTERRUPTIBLE_BY_VAD_TIME_SEC` — bot's protected window at turn start
+  (default `0.3`). Barge-in is live after this.
 - `STT_MODEL` — faster-whisper size (`tiny`/`base`/`small`/`medium`).
 - `AEC_ENABLED` / `AEC_DELAY_MS` / `AEC_NOISE_SUPPRESSION` — WebRTC AEC3
   echo cancellation (removes the bot's own TTS echo from the mic so full-duplex
@@ -136,12 +181,41 @@ same algorithm Chrome uses) to remove the echo:
 - `AEC_NOISE_SUPPRESSION=true` (default) — WebRTC noise suppression on top of
   AEC, so background noise isn't transcribed as a user turn.
 
-If AEC is disabled (`AEC_ENABLED=false`), the app falls back to muting the mic
-while the bot speaks (`MUTE_MIC_WHILE_BOT_SPEAKING=true`) — the reliable
-half-duplex mode that guarantees no self-reply.
-
 No model download or C++ build is needed — AEC3 ships with the
 `pywebrtc-audio` wheel (`pip install pywebrtc-audio`).
+
+### Barge-in without AEC
+
+If AEC is unavailable (`AEC_ENABLED=false` or `pywebrtc-audio` not installed),
+barge-in still works via a **playback-aware echo gate**: the app remembers how
+loud the bot's TTS just was and only treats a mic frame as *you* when it is
+`BARGE_IN_OVER_PLAYBACK_DB` louder than that recent playback. Your voice speaking
+over the bot interrupts it; the bot's own echo never makes it interrupt itself.
+
+- To force the old guaranteed half-duplex behavior instead (mute the mic while
+  the bot speaks), set `MUTE_MIC_WHILE_BOT_SPEAKING=true`.
+- Without AEC, a little of the bot's echo can still leak into the next turn's
+  recording (inherent — there's no true echo cancellation). AEC remains
+  recommended for the cleanest transcription.
+
+## Backchannels (active listening)
+
+While the user is speaking, the bot can emit short acknowledgments ("Mm-hmm",
+"Uh-huh") without taking the turn, so it feels like it's listening. It uses
+[VAP (Voice Activity Projection)](https://github.com/inokoj/VAP-Realtime) — a
+real-time (~8ms/frame) model that predicts when the listener should backchannel,
+from stereo audio (bot far-end + user near-end). The model code is vendored in
+`src/rvap/`; enable with:
+
+```bash
+BACKCHANNEL_ENABLED=true
+uv run python scripts/download_models.py   # fetches the VAP-BC + CPC models
+```
+
+The bot acks when VAP's backchannel probability exceeds `BACKCHANNEL_THRESHOLD`
+(0.5) and a cooldown (`BACKCHANNEL_COOLDOWN_SEC`) has elapsed. The ack never
+advances the conversation state (the user keeps their turn) and is fed to the
+AEC as reference so it isn't misheard as the user.
 
 ## Tests
 
