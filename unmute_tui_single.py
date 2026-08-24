@@ -171,6 +171,17 @@ class AECConfig:
 
 
 @dataclass
+class STTConfig:
+    """Speech-to-text backend selection (mirrors src/unmute_tui/config.py)."""
+
+    backend: str = "parakeet"
+    model: str = "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8"
+    language: str | None = None
+    models_dir: Path = Path("models/stt")
+    threads: int = 2
+
+
+@dataclass
 class Config:
     llm: LLMConfig = field(default_factory=LLMConfig)
     vad: VADConfig = field(default_factory=VADConfig)
@@ -179,8 +190,7 @@ class Config:
     aec: AECConfig = field(default_factory=AECConfig)
     backchannel: BackchannelConfig = field(default_factory=BackchannelConfig)
     models_dir: Path = Path("models")
-    stt_model: str = "base"
-    stt_language: str | None = None
+    stt: STTConfig = field(default_factory=STTConfig)
     debug: bool = False
 
     @classmethod
@@ -255,8 +265,17 @@ class Config:
                 ack_text=os.getenv("BACKCHANNEL_ACK_TEXT", "Mm-hmm."),
             ),
             models_dir=models_dir,
-            stt_model=os.getenv("STT_MODEL", "base"),
-            stt_language=os.getenv("STT_LANGUAGE") or None,
+            stt=STTConfig(
+                backend=os.getenv("STT_BACKEND", "parakeet").strip().lower(),
+                model=os.getenv(
+                    "STT_MODEL", "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8"
+                ),
+                language=os.getenv("STT_LANGUAGE") or None,
+                models_dir=Path(os.getenv("STT_MODELS_DIR", "models/stt"))
+                .expanduser()
+                .resolve(),
+                threads=_env_int("STT_THREADS", 2),
+            ),
             debug=_env_bool("DEBUG", False),
         )
 
@@ -754,7 +773,8 @@ class SemanticVAD:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STT (faster-whisper)
+# STT backends (pluggable local realtime speech-to-text)
+# parakeet (default) | sherpa (streaming zipformer) | moonshine | faster_whisper
 # ─────────────────────────────────────────────────────────────────────────────
 @dataclass
 class Segment:
@@ -770,18 +790,64 @@ class Transcription:
     language: str | None = None
 
 
-class Transcriber:
+_TAIL_PAD_SEC = 0.5
+_FEATURE_DIM = 80
+
+
+def _as_1d_float32(audio) -> np.ndarray:
+    audio = np.asarray(audio, dtype=np.float32)
+    if audio.ndim != 1:
+        audio = audio.reshape(-1)
+    return audio
+
+
+def _trailing_window(audio: np.ndarray, window_sec: float) -> np.ndarray:
+    n = int(window_sec * SAMPLE_RATE)
+    if len(audio) > n:
+        return audio[-n:]
+    return audio
+
+
+class STTBackend(ABC):
+    """Engine-facing interface implemented by every STT backend."""
+
+    def load(self) -> None:
+        """Pre-load all models (blocking); called before the event loop."""
+
+    def push(self, frame: np.ndarray) -> None:
+        """Feed one 16 kHz mono mic frame of the in-progress user turn.
+
+        Default: no-op (batch backends re-transcribe windows on demand).
+        """
+
+    @abstractmethod
+    def partial(
+        self, audio: np.ndarray | None = None, window_sec: float = 8.0
+    ) -> Transcription:
+        """The current partial transcript of the in-progress turn."""
+
+    @abstractmethod
+    def transcribe(self, audio: np.ndarray) -> Transcription:
+        """Final transcription of a completed turn (16 kHz mono float32)."""
+
+    def reset(self) -> None:
+        """Start a fresh turn (default: no-op)."""
+
+
+class FasterWhisperBackend(STTBackend):
+    """Batch transcription via faster-whisper (CTranslate2)."""
+
     def __init__(
         self,
         model_size: str = "base",
+        language: str | None = None,
         device: str = "cpu",
         compute_type: str = "int8",
-        language: str | None = None,
     ) -> None:
         self.model_size = model_size
+        self.language = language
         self.device = device
         self.compute_type = compute_type
-        self.language = language
         self._model = None
 
     def _load(self):
@@ -803,11 +869,9 @@ class Transcriber:
     def load(self) -> None:
         self._load()
 
-    def transcribe(self, audio: np.ndarray) -> Transcription:
+    def _transcribe(self, audio: np.ndarray) -> Transcription:
         model = self._load()
-        audio = np.asarray(audio, dtype=np.float32)
-        if audio.ndim != 1:
-            audio = audio.reshape(-1)
+        audio = _as_1d_float32(audio)
         if len(audio) == 0:
             return Transcription("", [])
         segments, info = model.transcribe(
@@ -823,6 +887,358 @@ class Transcriber:
         ]
         text = " ".join(s.text for s in segs).strip()
         return Transcription(text=text, segments=segs, language=info.language)
+
+    def transcribe(self, audio: np.ndarray) -> Transcription:
+        return self._transcribe(audio)
+
+    def partial(
+        self, audio: np.ndarray | None = None, window_sec: float = 8.0
+    ) -> Transcription:
+        if audio is None or len(audio) == 0:
+            return Transcription("", [])
+        return self._transcribe(_trailing_window(_as_1d_float32(audio), window_sec))
+
+
+class _SherpaModelDir:
+    """Resolves the encoder/decoder/joiner/tokens files in a model folder."""
+
+    def __init__(self, model_dir: Path) -> None:
+        self.model_dir = Path(model_dir)
+
+    def _find(self, patterns: list[str]) -> Path | None:
+        for pattern in patterns:
+            hits = sorted(self.model_dir.glob(pattern))
+            if hits:
+                return hits[0]
+        return None
+
+    @property
+    def encoder(self) -> Path:
+        return self._require(["encoder*.int8.onnx", "encoder*.onnx"], "encoder")
+
+    @property
+    def decoder(self) -> Path:
+        return self._require(["decoder*.onnx", "decoder*.int8.onnx"], "decoder")
+
+    @property
+    def joiner(self) -> Path:
+        return self._require(["joiner*.int8.onnx", "joiner*.onnx"], "joiner")
+
+    @property
+    def tokens(self) -> Path:
+        return self._require(["tokens.txt", "bpe.model"], "tokens")
+
+    def _require(self, patterns: list[str], name: str) -> Path:
+        hit = self._find(patterns)
+        if hit is None:
+            raise FileNotFoundError(
+                f"Sherpa-onnx {name} file not found in {self.model_dir}. "
+                "Run `uv run python scripts/download_models.py` first."
+            )
+        return hit
+
+
+class SherpaZipformerBackend(STTBackend):
+    """True streaming ASR via sherpa-onnx OnlineRecognizer."""
+
+    def __init__(
+        self,
+        model_dir: str | Path,
+        num_threads: int = 2,
+        language: str | None = None,
+    ) -> None:
+        self.model_dir = Path(model_dir)
+        self.num_threads = num_threads
+        self.language = language
+        self._recognizer = None
+        self._stream = None
+        self._lock = threading.Lock()
+
+    def _load(self):
+        if self._recognizer is not None:
+            return self._recognizer
+        try:
+            import sherpa_onnx
+        except ImportError as exc:
+            raise RuntimeError(
+                "sherpa-onnx is not installed. Run "
+                "`pip install sherpa-onnx` (or `uv sync --extra stt`)."
+            ) from exc
+        files = _SherpaModelDir(self.model_dir)
+        self._recognizer = sherpa_onnx.OnlineRecognizer.from_transducer(
+            tokens=str(files.tokens),
+            encoder=str(files.encoder),
+            decoder=str(files.decoder),
+            joiner=str(files.joiner),
+            num_threads=self.num_threads,
+            sample_rate=SAMPLE_RATE,
+            feature_dim=_FEATURE_DIM,
+            decoding_method="greedy_search",
+            provider="cpu",
+            model_type="",
+            enable_endpoint_detection=False,
+        )
+        return self._recognizer
+
+    def load(self) -> None:
+        self._load()
+
+    def push(self, frame: np.ndarray) -> None:
+        recognizer = self._load()
+        frame = _as_1d_float32(frame)
+        if len(frame) == 0:
+            return
+        with self._lock:
+            if self._stream is None:
+                self._stream = recognizer.create_stream()
+            self._stream.accept_waveform(SAMPLE_RATE, frame)
+            while recognizer.is_ready(self._stream):
+                recognizer.decode_stream(self._stream)
+
+    def partial(
+        self, audio: np.ndarray | None = None, window_sec: float = 8.0
+    ) -> Transcription:
+        recognizer = self._load()
+        with self._lock:
+            if self._stream is None:
+                return Transcription("", [])
+            text = recognizer.get_result(self._stream)
+        return Transcription(
+            text=text.strip().lower(), segments=[], language=self.language
+        )
+
+    def transcribe(self, audio: np.ndarray) -> Transcription:
+        recognizer = self._load()
+        audio = _as_1d_float32(audio)
+        with self._lock:
+            stream = recognizer.create_stream()
+            stream.accept_waveform(SAMPLE_RATE, audio)
+            pad = np.zeros(int(_TAIL_PAD_SEC * SAMPLE_RATE), dtype=np.float32)
+            stream.accept_waveform(SAMPLE_RATE, pad)
+            stream.input_finished()
+            while recognizer.is_ready(stream):
+                recognizer.decode_stream(stream)
+            text = recognizer.get_result(stream).strip().lower()
+        self.reset()
+        return Transcription(text=text, segments=[], language=self.language)
+
+    def reset(self) -> None:
+        with self._lock:
+            self._stream = None
+
+
+class ParakeetBackend(STTBackend):
+    """NVIDIA Parakeet TDT-0.6B via sherpa-onnx OfflineRecognizer."""
+
+    def __init__(
+        self,
+        model_dir: str | Path,
+        num_threads: int = 2,
+        language: str | None = None,
+    ) -> None:
+        self.model_dir = Path(model_dir)
+        self.num_threads = num_threads
+        self.language = language
+        self._recognizer = None
+        self._lock = threading.Lock()
+
+    def _load(self):
+        if self._recognizer is not None:
+            return self._recognizer
+        try:
+            import sherpa_onnx
+        except ImportError as exc:
+            raise RuntimeError(
+                "sherpa-onnx is not installed. Run "
+                "`pip install sherpa-onnx` (or `uv sync --extra stt`)."
+            ) from exc
+        files = _SherpaModelDir(self.model_dir)
+        self._check_decoder_metadata(files.decoder)
+        self._recognizer = sherpa_onnx.OfflineRecognizer.from_transducer(
+            encoder=str(files.encoder),
+            decoder=str(files.decoder),
+            joiner=str(files.joiner),
+            tokens=str(files.tokens),
+            num_threads=self.num_threads,
+            sample_rate=SAMPLE_RATE,
+            feature_dim=_FEATURE_DIM,
+            decoding_method="greedy_search",
+            provider="cpu",
+            model_type="nemo_transducer",
+        )
+        return self._recognizer
+
+    @staticmethod
+    def _check_decoder_metadata(decoder: Path) -> None:
+        try:
+            import onnxruntime as ort
+        except ImportError:
+            return
+        try:
+            so = ort.SessionOptions()
+            so.log_severity_level = 3
+            meta = ort.InferenceSession(
+                str(decoder), sess_options=so, providers=["CPUExecutionProvider"]
+            ).get_modelmeta().custom_metadata_map
+        except Exception:
+            return
+        if "vocab_size" not in meta:
+            raise RuntimeError(
+                f"Parakeet decoder is missing RNNT metadata ({decoder}). "
+                "Rerun `uv run python scripts/download_models.py` so the "
+                "metadata is patched, or use STT_BACKEND=sherpa/moonshine."
+            )
+
+    def load(self) -> None:
+        self._load()
+
+    def transcribe(self, audio: np.ndarray) -> Transcription:
+        recognizer = self._load()
+        audio = _as_1d_float32(audio)
+        with self._lock:
+            stream = recognizer.create_stream()
+            stream.accept_waveform(SAMPLE_RATE, audio)
+            recognizer.decode_streams([stream])
+            text = stream.result.text.strip()
+        return Transcription(text=text, segments=[], language=self.language)
+
+    def partial(
+        self, audio: np.ndarray | None = None, window_sec: float = 8.0
+    ) -> Transcription:
+        if audio is None or len(audio) == 0:
+            return Transcription("", [])
+        return self.transcribe(_trailing_window(_as_1d_float32(audio), window_sec))
+
+
+class MoonshineBackend(STTBackend):
+    """Moonshine v2 streaming STT via moonshine-voice's Transcriber API."""
+
+    def __init__(self, language: str = "en", update_interval: float = 0.3) -> None:
+        self.language = language
+        self.update_interval = update_interval
+        self._transcriber = None
+        self._stream = None
+        self._listener = None
+        self._text = ""
+        self._final_lines: list[str] = []
+        self._lock = threading.Lock()
+
+    def _load(self):
+        if self._transcriber is not None:
+            return self._transcriber
+        try:
+            from moonshine_voice import (
+                Transcriber,
+                TranscriptEventListener,
+                get_model_for_language,
+            )
+        except ImportError as exc:
+            raise RuntimeError(
+                "moonshine-voice is not installed. Run "
+                "`pip install moonshine-voice` (or `uv sync --extra stt`)."
+            ) from exc
+
+        class _Collector(TranscriptEventListener):
+            def __init__(self, owner) -> None:
+                super().__init__()
+                self._owner = owner
+
+            def on_line_text_changed(self, event) -> None:
+                self._owner._on_text(event.line.text)
+
+            def on_line_completed(self, event) -> None:
+                self._owner._on_line(event.line.text)
+
+        model_path, model_arch = get_model_for_language(self.language)
+        self._transcriber = Transcriber(
+            model_path=model_path, model_arch=model_arch
+        )
+        self._listener = _Collector(self)
+        return self._transcriber
+
+    def _ensure_stream(self):
+        self._load()
+        if self._stream is not None:
+            return self._stream
+        self._stream = self._transcriber.create_stream(
+            update_interval=self.update_interval
+        )
+        self._stream.add_listener(self._listener)
+        self._stream.start()
+        return self._stream
+
+    def _on_text(self, text: str) -> None:
+        with self._lock:
+            self._text = text
+
+    def _on_line(self, text: str) -> None:
+        with self._lock:
+            if text.strip():
+                self._final_lines.append(text.strip())
+            self._text = ""
+
+    def load(self) -> None:
+        self._load()
+
+    def push(self, frame: np.ndarray) -> None:
+        stream = self._ensure_stream()
+        frame = _as_1d_float32(frame)
+        if len(frame) == 0:
+            return
+        stream.add_audio(frame.tolist(), SAMPLE_RATE)
+
+    def partial(
+        self, audio: np.ndarray | None = None, window_sec: float = 8.0
+    ) -> Transcription:
+        self._load()
+        with self._lock:
+            text = self._text.strip()
+        return Transcription(text=text, segments=[])
+
+    def transcribe(self, audio: np.ndarray) -> Transcription:
+        self._load()
+        with self._lock:
+            text = (" ".join(self._final_lines) or self._text).strip()
+        return Transcription(text=text, segments=[])
+
+    def reset(self) -> None:
+        with self._lock:
+            self._text = ""
+            self._final_lines = []
+            if self._stream is not None:
+                try:
+                    self._stream.stop()
+                    self._stream.close()
+                except Exception:
+                    pass
+            self._stream = None
+
+
+def create_transcriber(config) -> STTBackend:
+    """Build the STT backend selected by ``config.backend``."""
+    backend = (config.backend or "parakeet").strip().lower()
+    if backend == "sherpa":
+        return SherpaZipformerBackend(
+            model_dir=config.models_dir / config.model,
+            num_threads=config.threads,
+            language=config.language,
+        )
+    if backend == "parakeet":
+        return ParakeetBackend(
+            model_dir=config.models_dir / config.model,
+            num_threads=config.threads,
+            language=config.language,
+        )
+    if backend == "moonshine":
+        return MoonshineBackend(language=config.language or "en")
+    if backend == "faster_whisper":
+        return FasterWhisperBackend(
+            model_size=config.model, language=config.language
+        )
+    raise ValueError(
+        f"Unknown STT_BACKEND {backend!r} "
+        "(expected parakeet | sherpa | moonshine | faster_whisper)"
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1611,10 +2027,7 @@ def build_engine(config: Config):
         turn_end_silence_sec=config.vad.turn_end_silence_sec,
         semantic_min_silence_sec=config.vad.semantic_min_silence_sec,
     )
-    transcriber = Transcriber(
-        model_size=config.stt_model,
-        language=config.stt_language,
-    )
+    transcriber = create_transcriber(config.stt)
     llm = LLM(config.llm)
     tts = create_tts(config.tts)
     mic = Microphone(device=config.audio.input_device)
