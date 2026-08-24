@@ -67,7 +67,8 @@ class _FakeRecognizer:
 
     @classmethod
     def from_transducer(cls, **kwargs):
-        cls.last_kwargs = dict(kwargs)
+        # Store on the base class so online/offline share one capture slot.
+        _FakeRecognizer.last_kwargs = dict(kwargs)
         return cls()
 
     def create_stream(self):
@@ -157,7 +158,14 @@ def test_sherpa_passes_expected_kwargs(tmp_path, fake_sherpa):
     assert kwargs["feature_dim"] == 80
     assert kwargs["decoding_method"] == "greedy_search"
     assert kwargs["provider"] == "cpu"
-    assert kwargs["enable_endpoint"] is False
+    assert kwargs["enable_endpoint_detection"] is False
+
+
+def test_parakeet_passes_nemo_model_type(tmp_path, fake_sherpa):
+    ParakeetBackend(model_dir=_make_model_dir(tmp_path)).load()
+    kwargs = _FakeRecognizer.last_kwargs
+    assert kwargs["model_type"] == "nemo_transducer"
+    assert kwargs["feature_dim"] == 80
 
 
 def test_sherpa_missing_model_files_raise(tmp_path, fake_sherpa):

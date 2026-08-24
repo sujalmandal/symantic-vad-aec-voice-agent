@@ -63,19 +63,61 @@ def _download_and_extract_tarbz2(name: str, dest_dir: Path) -> None:
     tarball = dest_dir / f"{name}.tar.bz2"
     if (dest_dir / name).exists():
         print(f"Sherpa-onnx model already present: {dest_dir / name}")
-        return
-    url = f"{SHERPA_RELEASE}/{name}.tar.bz2"
-    try:
-        _download_url(url, tarball)
-        print(f"Extracting {tarball} ...")
-        with tarfile.open(tarball, "r:bz2") as tf:
-            tf.extractall(dest_dir)  # noqa: S202 — trusted release artifacts
-        tarball.unlink()
-        print(f"Extracted to {dest_dir / name}")
-    except Exception as exc:  # noqa: BLE001
-        print(f"Warning: could not fetch {name}: {exc}")
-        if tarball.exists():
+    else:
+        url = f"{SHERPA_RELEASE}/{name}.tar.bz2"
+        try:
+            _download_url(url, tarball)
+            print(f"Extracting {tarball} ...")
+            with tarfile.open(tarball, "r:bz2") as tf:
+                tf.extractall(dest_dir)  # noqa: S202 — trusted release artifacts
             tarball.unlink()
+            print(f"Extracted to {dest_dir / name}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"Warning: could not fetch {name}: {exc}")
+            if tarball.exists():
+                tarball.unlink()
+
+
+def _patch_nemo_decoder_metadata(model_dir: Path) -> None:
+    """Patch missing RNNT metadata onto a NeMo (Parakeet) decoder ONNX.
+
+    The sherpa-onnx release of `parakeet-tdt-0.6b-v3` carries an int8 decoder
+    WITHOUT the `vocab_size`/`context_size` metadata that sherpa-onnx requires
+    (it hard-aborts otherwise). The encoder has the real values; we copy them
+    over so the Parakeet backend works out of the box.
+    """
+    decoder = model_dir / "decoder.int8.onnx"
+    encoder = model_dir / "encoder.int8.onnx"
+    if not decoder.exists() or not encoder.exists():
+        return
+    try:
+        import onnx
+    except ImportError:
+        print(
+            "Warning: `onnx` not installed; could not patch Parakeet decoder "
+            "metadata (pip install onnx then rerun)."
+        )
+        return
+    dec = onnx.load(str(decoder))
+    enc = onnx.load(str(encoder))
+    have = {p.key for p in dec.metadata_props}
+    enc_meta = {p.key: p.value for p in enc.metadata_props}
+    want = {
+        "vocab_size": enc_meta.get("vocab_size", ""),
+        "pred_rnn_layers": enc_meta.get("pred_rnn_layers", "2"),
+        "pred_hidden": enc_meta.get("pred_hidden", "640"),
+        "context_size": "2",  # NeMo transducer default
+    }
+    added = False
+    for key, value in want.items():
+        if key not in have and value:
+            prop = dec.metadata_props.add()
+            prop.key = key
+            prop.value = value
+            added = True
+    if added:
+        onnx.save(dec, str(decoder))
+        print(f"Patched RNNT metadata onto {decoder.name}")
 
 
 def main() -> None:
@@ -142,6 +184,9 @@ def main() -> None:
         stt_dir.mkdir(parents=True, exist_ok=True)
         _download_and_extract_tarbz2(ZIPFORMER_MODEL, stt_dir)
         _download_and_extract_tarbz2(PARAKEET_MODEL, stt_dir)
+        # Parakeet's int8 decoder ships without RNNT metadata; patch it so the
+        # backend doesn't hard-abort in sherpa-onnx.
+        _patch_nemo_decoder_metadata(stt_dir / PARAKEET_MODEL)
         print(
             f"STT models in {stt_dir}: set STT_BACKEND=sherpa (default) or "
             f"STT_BACKEND=parakeet with STT_MODEL={PARAKEET_MODEL}."

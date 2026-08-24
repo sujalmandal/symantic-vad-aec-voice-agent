@@ -239,7 +239,7 @@ class SherpaZipformerBackend(STTBackend):
                 "(or `pip install sherpa-onnx`)."
             ) from exc
         files = _SherpaModelDir(self.model_dir)
-        self._recognizer = sherpa_onnx.OnlineRecognizer.from_transducer_with_zipformer(  # noqa: E501
+        self._recognizer = sherpa_onnx.OnlineRecognizer.from_transducer(  # noqa: E501
             tokens=str(files.tokens),
             encoder=str(files.encoder),
             decoder=str(files.decoder),
@@ -249,7 +249,10 @@ class SherpaZipformerBackend(STTBackend):
             feature_dim=_FEATURE_DIM,
             decoding_method="greedy_search",
             provider="cpu",
-            enable_endpoint=False,  # the engine's VAD stays the turn arbiter
+            # Model type is inferred from the ONNX files; "" selects the
+            # zipformer transducer path for streaming zipformer models.
+            model_type="",
+            enable_endpoint_detection=False,  # engine's VAD stays turn arbiter
         )
         return self._recognizer
 
@@ -276,7 +279,10 @@ class SherpaZipformerBackend(STTBackend):
             if self._stream is None:
                 return Transcription("", [])
             text = recognizer.get_result(self._stream)
-        return Transcription(text=text.strip(), segments=[], language=self.language)
+        # Zipformer emits uppercase; normalize for natural LLM input.
+        return Transcription(
+            text=text.strip().lower(), segments=[], language=self.language
+        )
 
     def transcribe(self, audio: np.ndarray) -> Transcription:
         """Finalize: feed the full turn (fresh stream) + tail padding, then drain."""
@@ -290,7 +296,7 @@ class SherpaZipformerBackend(STTBackend):
             stream.input_finished()
             while recognizer.is_ready(stream):
                 recognizer.decode_stream(stream)
-            text = recognizer.get_result(stream).strip()
+            text = recognizer.get_result(stream).strip().lower()
         self.reset()
         return Transcription(text=text, segments=[], language=self.language)
 
@@ -326,18 +332,46 @@ class ParakeetBackend(STTBackend):
                 "(or `pip install sherpa-onnx`)."
             ) from exc
         files = _SherpaModelDir(self.model_dir)
+        # NeMo (Parakeet) int8 decoders sometimes ship without the RNNT
+        # metadata sherpa-onnx needs; without it the C++ layer hard-aborts.
+        # Fail with a helpful message before constructing the recognizer.
+        self._check_decoder_metadata(files.decoder)
         self._recognizer = sherpa_onnx.OfflineRecognizer.from_transducer(  # noqa: E501
-            tokens=str(files.tokens),
             encoder=str(files.encoder),
             decoder=str(files.decoder),
             joiner=str(files.joiner),
+            tokens=str(files.tokens),
             num_threads=self.num_threads,
             sample_rate=SAMPLE_RATE,
             feature_dim=_FEATURE_DIM,
             decoding_method="greedy_search",
             provider="cpu",
+            # NeMo RNNT exports (Parakeet) need the nemo_transducer model type
+            # so sherpa feeds the audio in the layout the encoder expects.
+            model_type="nemo_transducer",
         )
         return self._recognizer
+
+    @staticmethod
+    def _check_decoder_metadata(decoder: Path) -> None:
+        try:
+            import onnxruntime as ort
+        except ImportError:  # pragma: no cover
+            return  # onnxruntime is a core dep; if absent, let load fail later
+        try:
+            so = ort.SessionOptions()
+            so.log_severity_level = 3
+            meta = ort.InferenceSession(
+                str(decoder), sess_options=so, providers=["CPUExecutionProvider"]
+            ).get_modelmeta().custom_metadata_map
+        except Exception:  # noqa: BLE001 — unreadable file: fail downstream
+            return
+        if "vocab_size" not in meta:
+            raise RuntimeError(
+                f"Parakeet decoder is missing RNNT metadata ({decoder}). "
+                "Rerun `uv run python scripts/download_models.py` so the "
+                "metadata is patched, or use STT_BACKEND=sherpa/moonshine."
+            )
 
     def load(self) -> None:
         self._load()

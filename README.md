@@ -184,6 +184,7 @@ decoding — mic frames are fed as they arrive and `partial()` returns the words
 as they are spoken — so the LLM turn orchestrator sees the transcript with
 essentially zero extra latency, and it is far more accurate than the old
 whisper `base` on spontaneous speech (the "misunderstood words" problem).
+(Zipformer emits uppercase; the backend lowercases it for natural LLM input.)
 
 Setup (after `uv sync --extra stt`):
 

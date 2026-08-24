@@ -11,5 +11,8 @@ models/
 # Env / local config
 .env
 
+# Local uv cache (used when the sandbox blocks ~/.cache/uv)
+.uvcache/
+
 # OS
 .DS_Store
