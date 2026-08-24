@@ -11,8 +11,8 @@ def test_defaults(monkeypatch):
     assert cfg.llm.base_url == "http://localhost:11434/v1"
     assert cfg.vad.threshold == 0.6
     assert cfg.tts.backend == "chatterbox"
-    assert cfg.stt.backend == "sherpa"
-    assert cfg.stt.model == "sherpa-onnx-streaming-zipformer-en-2023-06-26"
+    assert cfg.stt.backend == "parakeet"
+    assert cfg.stt.model == "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8"
     assert cfg.stt.threads == 2
     assert cfg.turn.detector == "semantic"
     assert cfg.turn.min_partial_chars == 12

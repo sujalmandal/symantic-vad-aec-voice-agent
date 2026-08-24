@@ -165,20 +165,20 @@ class STTConfig:
     """Speech-to-text backend selection.
 
     `backend`:
-      - "sherpa" (default): sherpa-onnx streaming Zipformer — true incremental
-        streaming, RTF ~0.03-0.05 int8 on CPU, far more accurate than whisper
-        base.
+      - "parakeet" (default): NVIDIA Parakeet TDT-0.6B via sherpa-onnx offline
+        recognizer — best raw WER (~2.2% LibriSpeech clean), still realtime
+        (RTF ~0.04 on CPU). Non-streaming; partials re-transcribe a window.
+      - "sherpa": sherpa-onnx streaming Zipformer — true incremental streaming
+        (words as spoken), RTF ~0.02-0.05, slightly weaker WER than parakeet.
       - "moonshine": Moonshine v2 via moonshine-voice (very low latency).
-      - "parakeet": NVIDIA Parakeet TDT-0.6B via sherpa-onnx offline recognizer
-        (best raw WER; non-streaming).
       - "faster_whisper": the original faster-whisper backend (kept as
         fallback); `model` selects the size (e.g. "base", "large-v3-turbo").
     """
 
-    backend: str = "sherpa"
+    backend: str = "parakeet"
     # Backend-specific model: sherpa/parakeet = model folder name under
     # `models_dir`; faster_whisper = model size.
-    model: str = "sherpa-onnx-streaming-zipformer-en-2023-06-26"
+    model: str = "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8"
     language: str | None = None
     # Directory holding the sherpa-onnx / parakeet ONNX assets.
     models_dir: Path = Path("models/stt")
@@ -293,9 +293,9 @@ class Config:
             ),
             models_dir=models_dir,
             stt=STTConfig(
-                backend=os.getenv("STT_BACKEND", "sherpa").strip().lower(),
+                backend=os.getenv("STT_BACKEND", "parakeet").strip().lower(),
                 model=os.getenv(
-                    "STT_MODEL", "sherpa-onnx-streaming-zipformer-en-2023-06-26"
+                    "STT_MODEL", "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8"
                 ),
                 language=os.getenv("STT_LANGUAGE") or None,
                 models_dir=Path(os.getenv("STT_MODELS_DIR", "models/stt"))

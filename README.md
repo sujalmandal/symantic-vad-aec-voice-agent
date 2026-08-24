@@ -32,8 +32,8 @@ Terminal TUI (textual) ── asyncio events ──┐
         ▼               ▼                  ▼                  ▼
    Audio Capture    Semantic VAD        STT (words)        LLM (OpenAI-compat)
    (sounddevice)   Silero (activity)   sherpa-onnx         Ollama / cloud
-                   + Smart Turn v3     Zipformer           ──► TTS (Chatterbox)
-                   (turn-end prob)     (streaming)         (streaming) ──► playback
+                   + Smart Turn v3     Parakeet            ──► TTS (Chatterbox)
+                   (turn-end prob)     (RTF ~0.04)         (streaming) ──► playback
 ```
 
 ### Semantic VAD (semantic + silence)
@@ -174,31 +174,33 @@ The app ships with pluggable, fully local STT backends (select with `STT_BACKEND
 
 | `STT_BACKEND` | Model | Streaming | Speed (local CPU) | Accuracy |
 |---|---|---|---|---|
-| `sherpa` (default) | sherpa-onnx streaming Zipformer ([docs](https://k2-fsa.github.io/sherpa/onnx/pretrained_models/online-transducer/zipformer-transducer-models.html)) | ✅ true incremental partials | RTF ≈ 0.03–0.05 int8 (~20–30× realtime) | strong conversational WER |
+| `parakeet` (default) | NVIDIA Parakeet TDT-0.6B ([sherpa-onnx ONNX](https://github.com/mil-ad/parakeet-tdt-0.6b-v3-fastapi-openai)) | ❌ offline (fast) | RTF ≈ 0.04 (~25× realtime) | **best raw WER** (LS-clean ~2.2%) |
+| `sherpa` | sherpa-onnx streaming Zipformer ([docs](https://k2-fsa.github.io/sherpa/onnx/pretrained_models/online-transducer/zipformer-transducer-models.html)) | ✅ true incremental partials | RTF ≈ 0.02–0.05 int8 (~20–45× realtime) | strong conversational WER |
 | `moonshine` | Moonshine v2 ([repo](https://github.com/moonshine-ai/moonshine)) | ✅ streaming | very low latency (~150 ms Small) | competitive with Whisper Large V3 |
-| `parakeet` | NVIDIA Parakeet TDT-0.6B ([sherpa-onnx ONNX](https://github.com/mil-ad/parakeet-tdt-0.6b-v3-fastapi-openai)) | ❌ offline (fast) | RTF ≈ 0.05 | best raw WER (LS-clean ~2.2%) |
 | `faster_whisper` | faster-whisper `base`/`large-v3-turbo` | ❌ batch/windowed | — | lower than the above |
 
-Why `sherpa` is the default: it is the only backend with **true streaming**
-decoding — mic frames are fed as they arrive and `partial()` returns the words
-as they are spoken — so the LLM turn orchestrator sees the transcript with
-essentially zero extra latency, and it is far more accurate than the old
-whisper `base` on spontaneous speech (the "misunderstood words" problem).
-(Zipformer emits uppercase; the backend lowercases it for natural LLM input.)
+Why `parakeet` is the default: it has the **best raw word accuracy** of the
+bundle — it transcribed a local TTS round-trip with all confusable words
+correct ("I saw a bear at 8 o'clock, eating a pear by the seashore") while
+remaining ~25× faster than realtime. It is non-streaming: `partial()` returns
+the trailing-window re-transcription, so the LLM turn orchestrator still gets
+partials (that's the same mechanism the old faster-whisper used). Prefer
+`STT_BACKEND=sherpa` if you want *true* incremental partials (words appear as
+spoken) — its Zipformer decoder was verified on sherpa's reference wav.
 
 Setup (after `uv sync --extra stt`):
 
 ```bash
-uv run python scripts/download_models.py   # fetches the Zipformer (and Parakeet) models
-uv run unmute-tui                          # default STT_BACKEND=sherpa
+uv run python scripts/download_models.py   # fetches the Parakeet + Zipformer models
+uv run unmute-tui                          # default STT_BACKEND=parakeet
 ```
 
 Swap backends via `.env`:
 
 ```bash
-STT_BACKEND=moonshine          # or sherpa | parakeet | faster_whisper
-STT_MODELS_DIR=models/stt      # sherpa/parakeet ONNX assets
-STT_THREADS=2                  # decoder threads
+STT_BACKEND=sherpa            # or parakeet | moonshine | faster_whisper
+STT_MODELS_DIR=models/stt     # sherpa/parakeet ONNX assets
+STT_THREADS=2                 # decoder threads
 ```
 
 ## Acoustic echo cancellation (AEC)
